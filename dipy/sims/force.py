@@ -213,6 +213,15 @@ def _generate_batch_worker(
         f_ins_path,
         f_ins_shape,
         f_ins_dtype,
+        intra_odf_path,
+        intra_odf_shape,
+        intra_odf_dtype,
+        extra_odf_path,
+        extra_odf_shape,
+        extra_odf_dtype,
+        wm_dperp_raw_path,
+        wm_dperp_raw_shape,
+        wm_dperp_raw_dtype,
     ) = memmap_info
 
     # Apply diffusivity ranges in worker
@@ -270,6 +279,16 @@ def _generate_batch_worker(
         csf_d_par_path, mode="r+", dtype=csf_d_par_dtype, shape=csf_d_par_shape
     )
     f_ins_mm = np.memmap(f_ins_path, mode="r+", dtype=f_ins_dtype, shape=f_ins_shape)
+    intra_odf_mm = np.memmap(
+        intra_odf_path, mode="r+", dtype=intra_odf_dtype, shape=intra_odf_shape
+    )
+    extra_odf_mm = np.memmap(
+        extra_odf_path, mode="r+", dtype=extra_odf_dtype, shape=extra_odf_shape
+    )
+    wm_dperp_raw_mm = np.memmap(
+        wm_dperp_raw_path, mode="r+", dtype=wm_dperp_raw_dtype,
+        shape=wm_dperp_raw_shape,
+    )
 
     for i in range(batch_size):
         idx = start_idx + i
@@ -295,6 +314,9 @@ def _generate_batch_worker(
             gm_d_par_mm[idx],
             csf_d_par_mm[idx],
             f_ins_mm[idx],
+            intra_odf_mm[idx],
+            extra_odf_mm[idx],
+            wm_dperp_raw_mm[idx],
         ) = res
 
     # Flush memmaps
@@ -317,6 +339,9 @@ def _generate_batch_worker(
         gm_d_par_mm,
         csf_d_par_mm,
         f_ins_mm,
+        intra_odf_mm,
+        extra_odf_mm,
+        wm_dperp_raw_mm,
     ]:
         mm.flush()
 
@@ -372,6 +397,57 @@ def _main_is_guarded():
     return False
 
 
+def _signal_fit_scalars(
+    signals_mm, bvals, bvecs, gtab, num_simulations, dtype,
+    compute_dti, compute_dki, fa_dti, md_dti, rd_dti,
+    ak_arr, rk_arr, mk_arr, mkt_arr, kfa_arr, verbose,
+):
+    """Legacy ``metric_method='signal'`` path: fit the simulated signal on the
+    smallest shell(s).  Requires shell structure; kept for backward
+    compatibility and well-shelled acquisitions.
+    """
+    from tqdm import tqdm
+
+    from dipy.core.gradients import gradient_table as gt_func
+    from dipy.reconst import dti
+
+    if compute_dti:
+        _, shell_mask = smallest_shell_bval(bvals)
+        use_mask = shell_mask | (bvals <= gtab.b0_threshold)
+        gtab_small = gt_func(bvals[use_mask], bvecs=bvecs[use_mask])
+        dti_model = dti.TensorModel(gtab_small)
+        pbar = tqdm(total=num_simulations, desc="DTI fitting", disable=not verbose)
+        for start in range(0, num_simulations, 2000):
+            end = min(start + 2000, num_simulations)
+            dti_fit = dti_model.fit(signals_mm[start:end][:, use_mask])
+            fa_dti[start:end] = dti_fit.fa.astype(dtype)
+            md_dti[start:end] = dti_fit.md.astype(dtype)
+            rd_dti[start:end] = dti_fit.rd.astype(dtype)
+            pbar.update(end - start)
+        pbar.close()
+
+    if compute_dki:
+        from dipy.reconst.dki import DiffusionKurtosisModel
+
+        _, shell_mask = smallest_shell_bval(bvals, n=2)
+        use_mask = shell_mask | (bvals <= gtab.b0_threshold)
+        gtab_dki = gt_func(bvals[use_mask], bvecs=bvecs[use_mask])
+        dki_model = DiffusionKurtosisModel(gtab_dki)
+        pbar = tqdm(
+            total=num_simulations, desc="Kurtosis Estimation", disable=not verbose
+        )
+        for start in range(0, num_simulations, 2000):
+            end = min(start + 2000, num_simulations)
+            dki_fit = dki_model.multi_fit(signals_mm[start:end][:, use_mask])[0]
+            ak_arr[start:end] = dki_fit.ak().astype(dtype)
+            rk_arr[start:end] = dki_fit.rk().astype(dtype)
+            mk_arr[start:end] = dki_fit.mk().astype(dtype)
+            mkt_arr[start:end] = dki_fit.mkt().astype(dtype)
+            kfa_arr[start:end] = dki_fit.kfa.astype(dtype)
+            pbar.update(end - start)
+        pbar.close()
+
+
 def generate_force_simulations(
     gtab,
     *,
@@ -387,6 +463,16 @@ def generate_force_simulations(
     dtype=np.float32,
     compute_dti=True,
     compute_dki=False,
+    compute_mapmri=False,
+    compute_ng=False,
+    compute_qti=False,
+    metric_method="canonical",
+    mapmri_method="closed_form",
+    mapmri_fit_model="mapmri",
+    mapmri_canonical_bvals=(1000.0, 2000.0, 3000.0, 4000.0),
+    intra_dperp_floor=0.12e-3,
+    canonical_bvals=(1000.0, 2000.0),
+    store_mixture=False,
     verbose=True,
 ):
     """Generate FORCE simulations.
@@ -427,6 +513,63 @@ def generate_force_simulations(
         Compute DTI metrics (FA, MD, RD).
     compute_dki : bool, optional
         Compute DKI metrics (AK, RK, MK, KFA).
+    compute_mapmri : bool, optional
+        Compute MAP-MRI q-space scalars (RTOP, RTAP, RTPP, MSD, QIV).
+    compute_ng : bool, optional
+        Compute closed-form non-Gaussianity (NG, NGpar, NGperp) and propagator
+        anisotropy (PA) directly from the Gaussian mixture. NGperp is a
+        perpendicular-restriction marker; PA is a propagator-space anisotropy.
+    compute_qti : bool, optional
+        Compute closed-form QTI/DIVIDE invariants (micro_fa, coherence, k_bulk,
+        k_shear) from the mixture covariance. micro_fa is orientation-dispersion
+        invariant; k_bulk/k_shear split kurtosis into isotropic (free-water) and
+        anisotropic (fibre) parts. Available without tensor-valued acquisitions.
+    mapmri_method : {'closed_form', 'canonical', 'signal'}, optional
+        How the MAP-MRI/SHORE scalars are obtained.
+
+        * ``'closed_form'`` (default): exact EAP moments from the Gaussian
+          mixture (parameter-free; RTOP/RTAP/RTPP/MSD/QIV).
+        * ``'canonical'``: fit ``mapmri_fit_model`` to a noise-free signal
+          synthesized on a fixed canonical multi-shell q-space scheme
+          (``mapmri_canonical_bvals``). Scheme-independent; lets the closed
+          form be benchmarked against a real fit. A MAP-MRI fit also yields
+          NG/NGpar/NGperp.
+        * ``'signal'``: fit ``mapmri_fit_model`` to the simulated signal on the
+          actual gradient table.
+    mapmri_fit_model : {'mapmri', 'shore'}, optional
+        Which dipy model to fit when ``mapmri_method`` is ``'canonical'`` or
+        ``'signal'`` (SHORE yields only RTOP and MSD).
+    mapmri_canonical_bvals : tuple of float, optional
+        b-values of the canonical q-space scheme for ``mapmri_method``
+        ``'canonical'`` (more shells than ``canonical_bvals`` for radial
+        resolution).
+    metric_method : {'canonical', 'cumulant', 'signal'}, optional
+        How the stored DTI/DKI scalars are computed from each library entry.
+
+        * ``'canonical'`` (default): fit DTI/DKI to a noise-free signal
+          synthesized on a *fixed* multi-shell scheme (``canonical_bvals``) from
+          the known compartment model.  Scheme-independent (works for
+          single-shell/cartesian/random acquisitions) and matches conventional
+          finite-b DKI value ranges.
+        * ``'cumulant'``: store the exact b->0 diffusional kurtosis/tensor in
+          closed form from the compartment tensors.  Fastest and purest, but
+          free-water-sensitive (MD/MK run higher than conventional DKI).
+        * ``'signal'``: legacy behaviour -- fit DTI/DKI to the simulated signal
+          on the *actual* gradient table, restricting to the smallest shells.
+          Requires shells; fails/degrades on non-shelled data.
+    intra_dperp_floor : float, optional
+        Intra-axonal radial-diffusivity floor (mm^2/s) used only when computing
+        the singular MAP-MRI indices (RTOP/RTAP/RTPP/QIV); does not affect the
+        stored signal.
+    canonical_bvals : tuple of float, optional
+        b-values of the fixed canonical scheme used by
+        ``metric_method='canonical'``.
+    store_mixture : bool, optional
+        Also return the per-entry Gaussian-mixture ingredients (``intra_odf``,
+        ``extra_odf``, ``wm_d_par``, ``wm_d_perp``, ``gm_d``, ``csf_d``). These
+        let any DTI/DKI/MAP-MRI metric be recomputed later under any
+        ``metric_method`` without regenerating (e.g. for method-sensitivity
+        analyses). Adds ~2*n_dirs floats per entry.
     verbose : bool, optional
         Enable progress output.
 
@@ -507,6 +650,12 @@ def generate_force_simulations(
     gm_d_par_mm = create_mm("gm_d_par", dtype, (num_simulations,))
     csf_d_par_mm = create_mm("csf_d_par", dtype, (num_simulations,))
     f_ins_mm = create_mm("f_ins", dtype, (num_simulations, 3))
+    # Per-voxel intra/extra orientation weights + raw extra-axonal perpendicular
+    # diffusivity: everything needed to reconstruct the exact Gaussian mixture
+    # for analytic (scheme-independent) DTI/DKI/MAP-MRI in _force_moments.
+    intra_odf_mm = create_mm("intra_odf", dtype, (num_simulations, n_dirs))
+    extra_odf_mm = create_mm("extra_odf", dtype, (num_simulations, n_dirs))
+    wm_dperp_raw_mm = create_mm("wm_dperp_raw", dtype, (num_simulations,))
 
     memmaps = [
         signals_mm,
@@ -527,6 +676,9 @@ def generate_force_simulations(
         gm_d_par_mm,
         csf_d_par_mm,
         f_ins_mm,
+        intra_odf_mm,
+        extra_odf_mm,
+        wm_dperp_raw_mm,
     ]
 
     # Build batch specs
@@ -596,6 +748,15 @@ def generate_force_simulations(
         dtype,
         memmap_paths["f_ins"],
         (num_simulations, 3),
+        dtype,
+        memmap_paths["intra_odf"],
+        (num_simulations, n_dirs),
+        dtype,
+        memmap_paths["extra_odf"],
+        (num_simulations, n_dirs),
+        dtype,
+        memmap_paths["wm_dperp_raw"],
+        (num_simulations,),
         dtype,
     )
 
@@ -709,67 +870,204 @@ def generate_force_simulations(
     for mm in memmaps:
         mm.flush()
 
-    # Compute DTI metrics
+    # Per-entry DTI / DKI / MAP-MRI scalars -------------------------------
     fa_dti = np.zeros(num_simulations, dtype=dtype)
     md_dti = np.zeros(num_simulations, dtype=dtype)
     rd_dti = np.zeros(num_simulations, dtype=dtype)
-
-    # Compute DKI metrics
     ak_arr = np.zeros(num_simulations, dtype=dtype)
     rk_arr = np.zeros(num_simulations, dtype=dtype)
     mk_arr = np.zeros(num_simulations, dtype=dtype)
+    mkt_arr = np.zeros(num_simulations, dtype=dtype)
     kfa_arr = np.zeros(num_simulations, dtype=dtype)
+    if mapmri_method == "closed_form":
+        _mapmri_keys = ("rtop", "rtap", "rtpp", "msd", "qiv")
+    elif mapmri_fit_model == "shore":
+        from dipy.sims._force_moments import SHORE_FIT_KEYS as _mapmri_keys
+    else:
+        from dipy.sims._force_moments import MAPMRI_FIT_KEYS as _mapmri_keys
+    mapmri_arr = {k: np.zeros(num_simulations, dtype=dtype) for k in _mapmri_keys}
 
-    if compute_dti:
-        from dipy.core.gradients import gradient_table as gt_func
-
-        min_b, shell_mask = smallest_shell_bval(bvals)
-        b0_mask = bvals <= gtab.b0_threshold
-        use_mask = shell_mask | b0_mask
-
-        gtab_small = gt_func(bvals[use_mask], bvecs=bvecs[use_mask])
-        dti_model = dti.TensorModel(gtab_small)
-
-        dti_batch_size = 2000
-        pbar = tqdm(total=num_simulations, desc="DTI fitting", disable=not verbose)
-
-        for start in range(0, num_simulations, dti_batch_size):
-            end = min(start + dti_batch_size, num_simulations)
-            data_batch = signals_mm[start:end][:, use_mask]
-            dti_fit = dti_model.fit(data_batch)
-            fa_dti[start:end] = dti_fit.fa.astype(dtype)
-            md_dti[start:end] = dti_fit.md.astype(dtype)
-            rd_dti[start:end] = dti_fit.rd.astype(dtype)
-            pbar.update(end - start)
-
-        pbar.close()
-
-    if compute_dki:
-        from dipy.core.gradients import gradient_table as gt_func
-        from dipy.reconst.dki import DiffusionKurtosisModel
-
-        min_bs, shell_mask = smallest_shell_bval(bvals, n=2)
-        b0_mask = bvals <= gtab.b0_threshold
-        use_mask = shell_mask | b0_mask
-
-        gtab_dki = gt_func(bvals[use_mask], bvecs=bvecs[use_mask])
-        dki_model = DiffusionKurtosisModel(gtab_dki)
-
-        dki_batch_size = 2000
-        pbar = tqdm(
-            total=num_simulations, desc="Kurtosis Estimation", disable=not verbose
+    if metric_method not in ("canonical", "cumulant", "signal"):
+        raise ValueError(
+            "metric_method must be 'canonical', 'cumulant' or 'signal', "
+            f"got {metric_method!r}."
         )
 
-        for start in range(0, num_simulations, dki_batch_size):
-            end = min(start + dki_batch_size, num_simulations)
-            data_batch = signals_mm[start:end][:, use_mask]
-            dki_fit = dki_model.multi_fit(data_batch)[0]
-            ak_arr[start:end] = dki_fit.ak().astype(dtype)
-            rk_arr[start:end] = dki_fit.rk().astype(dtype)
-            mk_arr[start:end] = dki_fit.mk().astype(dtype)
-            kfa_arr[start:end] = dki_fit.kfa.astype(dtype)
-            pbar.update(end - start)
+    # Diffusion time tau sets the physical scale of the MAP-MRI indices. When
+    # the gtab lacks timings we fall back to dipy's default tau = 1/(4*pi**2);
+    # the resulting RTOP/RTAP/RTPP/MSD/QIV are then in *normalized* units (only
+    # voxel-to-voxel contrast is meaningful). Supply big_delta/small_delta for
+    # physical (mm-based) values.
+    tau = 1.0 / (4.0 * np.pi**2)
+    if getattr(gtab, "big_delta", None) is not None and (
+        getattr(gtab, "small_delta", None) is not None
+    ):
+        tau = float(gtab.big_delta - gtab.small_delta / 3.0)
 
+    from dipy.core.gradients import gradient_table as gt_func
+    from dipy.sims._force_moments import (
+        NG_PA_KEYS,
+        QTI_KEYS,
+        dki_params_from_moments,
+        dki_scalars_from_params,
+        mapmri_closed_form_indices,
+        mapmri_indices_via_fit,
+        moments_from_odfs,
+        ng_pa_from_odfs,
+        orientation_moment_tensors,
+        qti_indices_from_moments,
+        synth_signal_from_odfs,
+    )
+    ng_arr = {k: np.zeros(num_simulations, dtype=dtype) for k in NG_PA_KEYS}
+    qti_arr = {k: np.zeros(num_simulations, dtype=dtype) for k in QTI_KEYS}
+
+    verts = target_sphere
+
+    def _read_mixture(start, end):
+        return (
+            np.asarray(intra_odf_mm[start:end], dtype=np.float64),
+            np.asarray(extra_odf_mm[start:end], dtype=np.float64),
+            np.asarray(wm_d_par_mm[start:end], dtype=np.float64),
+            np.asarray(wm_dperp_raw_mm[start:end], dtype=np.float64),
+            np.asarray(gm_fraction_mm[start:end], dtype=np.float64),
+            np.asarray(gm_d_par_mm[start:end], dtype=np.float64),
+            np.asarray(csf_fraction_mm[start:end], dtype=np.float64),
+            np.asarray(csf_d_par_mm[start:end], dtype=np.float64),
+        )
+
+    def _canonical_gtab(shell_bvals):
+        cb = [0.0] * 6
+        cvec = [[0.0, 0.0, 1.0]] * 6
+        for b in shell_bvals:
+            for v in verts:
+                cb.append(float(b))
+                cvec.append(v)
+        return gt_func(
+            np.asarray(cb), bvecs=np.asarray(cvec),
+            big_delta=getattr(gtab, "big_delta", None),
+            small_delta=getattr(gtab, "small_delta", None),
+        )
+
+    step = 2000
+
+    # --- DTI / DKI ---------------------------------------------------------
+    if compute_dti or compute_dki:
+        if metric_method == "signal":
+            # Legacy: fit the simulated signal on the smallest shell(s).
+            _signal_fit_scalars(
+                signals_mm, bvals, bvecs, gtab, num_simulations, dtype,
+                compute_dti, compute_dki, fa_dti, md_dti, rd_dti,
+                ak_arr, rk_arr, mk_arr, mkt_arr, kfa_arr, verbose,
+            )
+        else:
+            VV, VV4 = orientation_moment_tensors(verts)
+            dti_model = dki_model = canon_gtab = None
+            if metric_method == "canonical":
+                from dipy.reconst.dki import DiffusionKurtosisModel
+
+                canon_gtab = _canonical_gtab(canonical_bvals)
+                dti_model = dti.TensorModel(canon_gtab)
+                if compute_dki:
+                    dki_model = DiffusionKurtosisModel(canon_gtab)
+            pbar = tqdm(total=num_simulations, desc=f"DKI ({metric_method})",
+                        disable=not verbose)
+            for start in range(0, num_simulations, step):
+                end = min(start + step, num_simulations)
+                io, eo, dpar, dperp, gmf, gmd, csff, csfd = _read_mixture(start, end)
+                if metric_method == "cumulant":
+                    D_app, C = moments_from_odfs(
+                        io, eo, verts, dpar, dperp, gmf, gmd, csff, csfd,
+                        VV=VV, VV4=VV4,
+                    )
+                    sc = dki_scalars_from_params(dki_params_from_moments(D_app, C))
+                else:  # canonical
+                    S = synth_signal_from_odfs(
+                        io, eo, verts, dpar, dperp, gmf, gmd, csff, csfd,
+                        canon_gtab.bvals, canon_gtab.bvecs,
+                    )
+                    if compute_dki:
+                        f = dki_model.fit(S)
+                        sc = {"fa": f.fa, "md": f.md, "rd": f.rd,
+                              "ak": f.ak(), "rk": f.rk(), "mk": f.mk(),
+                              "mkt": f.mkt(), "kfa": f.kfa}
+                    else:
+                        f = dti_model.fit(S)
+                        sc = {"fa": f.fa, "md": f.md, "rd": f.rd}
+                fa_dti[start:end] = np.asarray(sc["fa"], dtype)
+                md_dti[start:end] = np.asarray(sc["md"], dtype)
+                rd_dti[start:end] = np.asarray(sc["rd"], dtype)
+                if compute_dki:
+                    ak_arr[start:end] = np.asarray(sc["ak"], dtype)
+                    rk_arr[start:end] = np.asarray(sc["rk"], dtype)
+                    mk_arr[start:end] = np.asarray(sc["mk"], dtype)
+                    mkt_arr[start:end] = np.asarray(sc["mkt"], dtype)
+                    kfa_arr[start:end] = np.asarray(sc["kfa"], dtype)
+                pbar.update(end - start)
+            pbar.close()
+
+    # --- MAP-MRI / SHORE (independent of the DKI metric_method) -----------
+    if compute_mapmri:
+        if mapmri_method not in ("closed_form", "canonical", "signal"):
+            raise ValueError(
+                "mapmri_method must be 'closed_form', 'canonical' or 'signal', "
+                f"got {mapmri_method!r}."
+            )
+        mm_gtab = (_canonical_gtab(mapmri_canonical_bvals)
+                   if mapmri_method == "canonical" else None)
+        pbar = tqdm(total=num_simulations, desc=f"MAP-MRI ({mapmri_method})",
+                    disable=not verbose)
+        for start in range(0, num_simulations, step):
+            end = min(start + step, num_simulations)
+            if mapmri_method == "closed_form":
+                io, eo, dpar, dperp, gmf, gmd, csff, csfd = _read_mixture(start, end)
+                idx = mapmri_closed_form_indices(
+                    io, eo, verts, dpar, dperp, gmf, gmd, csff, csfd, tau,
+                    d_perp_floor=intra_dperp_floor,
+                )
+            elif mapmri_method == "canonical":
+                io, eo, dpar, dperp, gmf, gmd, csff, csfd = _read_mixture(start, end)
+                S = synth_signal_from_odfs(
+                    io, eo, verts, dpar, dperp, gmf, gmd, csff, csfd,
+                    mm_gtab.bvals, mm_gtab.bvecs,
+                )
+                idx = mapmri_indices_via_fit(S, mm_gtab, model=mapmri_fit_model)
+            else:  # signal
+                idx = mapmri_indices_via_fit(
+                    np.asarray(signals_mm[start:end], dtype=np.float64),
+                    gtab, model=mapmri_fit_model,
+                )
+            for k in mapmri_arr:
+                mapmri_arr[k][start:end] = np.asarray(idx[k], dtype)
+            pbar.update(end - start)
+        pbar.close()
+
+    # --- non-Gaussianity + propagator anisotropy (closed form) -----------
+    if compute_ng:
+        pbar = tqdm(total=num_simulations, desc="NG / PA (closed form)",
+                    disable=not verbose)
+        for start in range(0, num_simulations, step):
+            end = min(start + step, num_simulations)
+            io, eo, dpar, dperp, gmf, gmd, csff, csfd = _read_mixture(start, end)
+            r = ng_pa_from_odfs(io, eo, verts, dpar, dperp, gmf, gmd, csff, csfd,
+                                floor=intra_dperp_floor)
+            for k in NG_PA_KEYS:
+                ng_arr[k][start:end] = np.asarray(r[k], dtype)
+            pbar.update(end - start)
+        pbar.close()
+
+    # --- QTI / DIVIDE invariants (closed form from the covariance) --------
+    if compute_qti:
+        pbar = tqdm(total=num_simulations, desc="QTI (closed form)",
+                    disable=not verbose)
+        for start in range(0, num_simulations, step):
+            end = min(start + step, num_simulations)
+            io, eo, dpar, dperp, gmf, gmd, csff, csfd = _read_mixture(start, end)
+            D_app, C = moments_from_odfs(
+                io, eo, verts, dpar, dperp, gmf, gmd, csff, csfd)
+            r = qti_indices_from_moments(D_app, C)
+            for k in QTI_KEYS:
+                qti_arr[k][start:end] = np.asarray(r[k], dtype)
+            pbar.update(end - start)
         pbar.close()
 
     # Build output simulations dict
@@ -797,9 +1095,29 @@ def generate_force_simulations(
                 "ak": ak_arr,
                 "rk": rk_arr,
                 "mk": mk_arr,
+                "mkt": mkt_arr,
                 "kfa": kfa_arr,
             }
         )
+
+    if compute_mapmri:
+        simulations.update(mapmri_arr)
+
+    if compute_ng:
+        simulations.update(ng_arr)
+
+    if compute_qti:
+        simulations.update(qti_arr)
+
+    if store_mixture:
+        simulations.update({
+            "intra_odf": np.array(intra_odf_mm),
+            "extra_odf": np.array(extra_odf_mm),
+            "wm_d_par": np.array(wm_d_par_mm),
+            "wm_d_perp": np.array(wm_dperp_raw_mm),
+            "gm_d": np.array(gm_d_par_mm),
+            "csf_d": np.array(csf_d_par_mm),
+        })
 
     # Cleanup memmaps
     for mm in memmaps:

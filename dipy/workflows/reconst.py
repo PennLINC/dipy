@@ -3463,6 +3463,12 @@ class ReconstForceFlow(Workflow):
         num_cpus=-1,
         use_cache=True,
         compute_kurtosis=False,
+        compute_mapmri=False,
+        compute_ng=False,
+        compute_qti=False,
+        metric_method="canonical",
+        mapmri_method="closed_form",
+        mapmri_fit_model="mapmri",
         engine="serial",
         save_metrics=None,
         verbose=False,
@@ -3482,7 +3488,21 @@ class ReconstForceFlow(Workflow):
         out_mk="mk.nii.gz",
         out_ak="ak.nii.gz",
         out_rk="rk.nii.gz",
+        out_mkt="mkt.nii.gz",
         out_kfa="kfa.nii.gz",
+        out_rtop="rtop.nii.gz",
+        out_rtap="rtap.nii.gz",
+        out_rtpp="rtpp.nii.gz",
+        out_msd="msd.nii.gz",
+        out_qiv="qiv.nii.gz",
+        out_ng="ng.nii.gz",
+        out_ngpar="ngpar.nii.gz",
+        out_ngperp="ngperp.nii.gz",
+        out_pa="pa.nii.gz",
+        out_micro_fa="micro_fa.nii.gz",
+        out_coherence="coherence.nii.gz",
+        out_k_bulk="k_bulk.nii.gz",
+        out_k_shear="k_shear.nii.gz",
         out_entropy="entropy.nii.gz",
         out_predicted_signal="predicted_signal.nii.gz",
         out_peaks="peaks.pam5",
@@ -3533,6 +3553,26 @@ class ReconstForceFlow(Workflow):
             Load cached simulations if available.
         compute_kurtosis : bool, optional
             Compute kurtosis metrics (mk, ak, rk, kfa) during simulation.
+        compute_mapmri : bool, optional
+            Compute MAP-MRI q-space scalars (rtop, rtap, rtpp, msd, qiv; plus
+            ng/ngpar/ngperp for a MAP-MRI fit).
+        mapmri_method : string, optional
+            How MAP-MRI/SHORE scalars are obtained: 'closed_form' (default,
+            exact EAP moments), 'canonical' (fit mapmri_fit_model to a synthetic
+            canonical multi-shell signal), or 'signal' (fit to the acquisition).
+        mapmri_fit_model : string, optional
+            'mapmri' or 'shore' -- model to fit when mapmri_method is not
+            'closed_form'.
+        compute_ng : bool, optional
+            Compute closed-form non-Gaussianity (ng, ngpar, ngperp) and
+            propagator anisotropy (pa) from the Gaussian mixture.
+        compute_qti : bool, optional
+            Compute closed-form QTI/DIVIDE invariants (micro_fa, coherence,
+            k_bulk, k_shear) from the mixture covariance.
+        metric_method : string, optional
+            How DTI/DKI scalars are computed: 'canonical' (default) and
+            'cumulant' are analytic and work for any sampling scheme (including
+            single-shell); 'signal' is the legacy shell-based fit.
         engine : string, optional
             Parallel engine for fitting: "ray" or "serial". If "ray" is
             requested but not installed, falls back to "serial" with a warning.
@@ -3575,8 +3615,40 @@ class ReconstForceFlow(Workflow):
             Name of the axial kurtosis volume to be saved (requires compute_kurtosis).
         out_rk : string, optional
             Name of the radial kurtosis volume to be saved (requires compute_kurtosis).
+        out_mkt : string, optional
+            Name of the mean-kurtosis-tensor volume to be saved (requires
+            compute_kurtosis).
         out_kfa : string, optional
             Name of the kurtosis FA volume to be saved (requires compute_kurtosis).
+        out_rtop : string, optional
+            Name of the RTOP volume to be saved (requires compute_mapmri).
+        out_rtap : string, optional
+            Name of the RTAP volume to be saved (requires compute_mapmri).
+        out_rtpp : string, optional
+            Name of the RTPP volume to be saved (requires compute_mapmri).
+        out_msd : string, optional
+            Name of the MSD volume to be saved (requires compute_mapmri).
+        out_qiv : string, optional
+            Name of the QIV volume to be saved (requires compute_mapmri).
+        out_ng : string, optional
+            Name of the non-Gaussianity volume (requires compute_mapmri with a
+            MAP-MRI fit).
+        out_ngpar : string, optional
+            Name of the parallel non-Gaussianity volume (MAP-MRI fit only).
+        out_ngperp : string, optional
+            Name of the perpendicular non-Gaussianity volume (restriction).
+        out_pa : string, optional
+            Name of the propagator-anisotropy volume (requires compute_ng).
+        out_micro_fa : string, optional
+            Name of the microscopic-FA (uFA) volume (requires compute_qti).
+        out_coherence : string, optional
+            Name of the orientation-coherence volume (requires compute_qti).
+        out_k_bulk : string, optional
+            Name of the isotropic (free-water) kurtosis volume (requires
+            compute_qti).
+        out_k_shear : string, optional
+            Name of the anisotropic (fibre) kurtosis volume (requires
+            compute_qti).
         out_entropy : string, optional
             Name of the entropy volume to be saved (requires use_posterior).
         out_predicted_signal : string, optional
@@ -3636,7 +3708,21 @@ class ReconstForceFlow(Workflow):
             omk,
             oak,
             ork,
+            omkt,
             okfa,
+            ortop,
+            ortap,
+            ortpp,
+            omsd,
+            oqiv,
+            ong,
+            ongpar,
+            ongperp,
+            opa,
+            omicro_fa,
+            ocoherence,
+            ok_bulk,
+            ok_shear,
             oentropy,
             opredicted_signal,
             opeaks,
@@ -3673,6 +3759,12 @@ class ReconstForceFlow(Workflow):
                 num_cpus=num_cpus,
                 use_cache=use_cache,
                 compute_dki=compute_kurtosis,
+                compute_mapmri=compute_mapmri,
+                compute_ng=compute_ng,
+                compute_qti=compute_qti,
+                metric_method=metric_method,
+                mapmri_method=mapmri_method,
+                mapmri_fit_model=mapmri_fit_model,
                 verbose=verbose,
             )
 
@@ -3709,7 +3801,17 @@ class ReconstForceFlow(Workflow):
             ]
             conditional_metrics = []
             if compute_kurtosis:
-                conditional_metrics.extend(["mk", "ak", "rk", "kfa"])
+                conditional_metrics.extend(["mk", "ak", "rk", "mkt", "kfa"])
+            if compute_mapmri:
+                conditional_metrics.extend(
+                    ["rtop", "rtap", "rtpp", "msd", "qiv", "ng", "ngpar", "ngperp"]
+                )
+            if compute_ng:
+                conditional_metrics.extend(["ng", "ngpar", "ngperp", "pa"])
+            if compute_qti:
+                conditional_metrics.extend(
+                    ["micro_fa", "coherence", "k_bulk", "k_shear"]
+                )
             if use_posterior:
                 conditional_metrics.append("entropy")
 
@@ -3731,7 +3833,21 @@ class ReconstForceFlow(Workflow):
                 "mk": (omk, force_fit.mk),
                 "ak": (oak, force_fit.ak),
                 "rk": (ork, force_fit.rk),
+                "mkt": (omkt, force_fit.mkt),
                 "kfa": (okfa, force_fit.kfa),
+                "rtop": (ortop, force_fit.rtop),
+                "rtap": (ortap, force_fit.rtap),
+                "rtpp": (ortpp, force_fit.rtpp),
+                "msd": (omsd, force_fit.msd),
+                "qiv": (oqiv, force_fit.qiv),
+                "ng": (ong, force_fit.ng),
+                "ngpar": (ongpar, force_fit.ngpar),
+                "ngperp": (ongperp, force_fit.ngperp),
+                "pa": (opa, force_fit.pa),
+                "micro_fa": (omicro_fa, force_fit.micro_fa),
+                "coherence": (ocoherence, force_fit.coherence),
+                "k_bulk": (ok_bulk, force_fit.k_bulk),
+                "k_shear": (ok_shear, force_fit.k_shear),
                 "entropy": (oentropy, force_fit.entropy),
                 "predicted_signal": (opredicted_signal, force_fit.predicted_signal),
             }

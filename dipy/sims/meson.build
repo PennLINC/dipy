@@ -17,6 +17,7 @@ endforeach
 
 python_sources = [
   '__init__.py',
+  '_force_moments.py',
   'force.py',
   'phantom.py',
   'voxel.py',

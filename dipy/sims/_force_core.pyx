@@ -299,6 +299,13 @@ cpdef tuple generate_single_fiber(
     nearest = _closest_direction(target_sphere, true_stick)
     labels[nearest] = 1
 
+    # Per-compartment orientation weights (before wm_fraction scaling): the
+    # intra-axonal (stick) and extra-axonal (zeppelin) fractions of the fibre
+    # ODF.  Used by dipy.sims._force_moments to reconstruct the exact Gaussian
+    # mixture (tensors + signal) without re-fitting the signal.
+    intra_odf = f_intra * fodf_gt
+    extra_odf = f_extra * fodf_gt
+
     return (
         S * S0,
         labels,
@@ -311,6 +318,9 @@ cpdef tuple generate_single_fiber(
         f_extra * d_perp_extra,
         [1.0, 0.0, 0.0],
         [f_intra],
+        intra_odf,
+        extra_odf,
+        d_perp_extra,
     )
 
 
@@ -406,6 +416,8 @@ cpdef tuple generate_two_fibers(
 
     S = np.zeros(bvals.shape[0], dtype=np.float64)
     fodf = np.zeros(n_dirs, dtype=np.float64)
+    intra_odf = np.zeros(n_dirs, dtype=np.float64)
+    extra_odf = np.zeros(n_dirs, dtype=np.float64)
 
     for i in range(2):
         fodf_gt = bingham_sf[int(index[i])][factor]
@@ -421,6 +433,8 @@ cpdef tuple generate_two_fibers(
         f_extra = 1.0 - f_intra
 
         S += fiber_fractions[i] * (f_intra * S_in + f_extra * S_ex)
+        intra_odf += fiber_fractions[i] * f_intra * fodf_gt
+        extra_odf += fiber_fractions[i] * f_extra * fodf_gt
 
     labels[_closest_direction(target_sphere, true_stick1)] = 1
     labels[_closest_direction(target_sphere, true_stick2)] = 1
@@ -443,6 +457,9 @@ cpdef tuple generate_two_fibers(
         wm_d_perp,
         [fiber_frac1, 1.0 - fiber_frac1, 0.0],
         f_in.tolist(),
+        intra_odf,
+        extra_odf,
+        d_perp_extra,
     )
 
 
@@ -553,6 +570,8 @@ cpdef tuple generate_three_fibers(
 
     fodf = np.zeros(n_dirs, dtype=np.float64)
     S = np.zeros(bvals.shape[0], dtype=np.float64)
+    intra_odf = np.zeros(n_dirs, dtype=np.float64)
+    extra_odf = np.zeros(n_dirs, dtype=np.float64)
 
     for k in range(3):
         fodf_gt = bingham_sf[int(index[k])][factor]
@@ -565,6 +584,8 @@ cpdef tuple generate_three_fibers(
         S_ex = multi_tensor_func(mevals_ex, evecs, fodf_gt * 100.0, bvals, bvecs)
 
         S += fiber_fracs[k] * (float(f_in[k]) * S_in + (1.0 - float(f_in[k])) * S_ex)
+        intra_odf += fiber_fracs[k] * float(f_in[k]) * fodf_gt
+        extra_odf += fiber_fracs[k] * (1.0 - float(f_in[k])) * fodf_gt
 
     labels[_closest_direction(target_sphere, true_stick1)] = 1
     labels[_closest_direction(target_sphere, true_stick2)] = 1
@@ -586,6 +607,9 @@ cpdef tuple generate_three_fibers(
         wm_d_perp,
         fiber_fracs.tolist(),
         f_in.tolist(),
+        intra_odf,
+        extra_odf,
+        d_perp_extra,
     )
 
 
@@ -816,6 +840,9 @@ cpdef tuple create_mixed_signal(
     wm_d_perp = wm_result[8]
     fracs = wm_result[9]
     f_ins = wm_result[10]
+    wm_intra_odf = wm_result[11]
+    wm_extra_odf = wm_result[12]
+    wm_d_perp_raw = wm_result[13]
 
     gm_result = create_gm_signal(bvals, target_sphere)
     gm_signal = gm_result[0]
@@ -859,6 +886,14 @@ cpdef tuple create_mixed_signal(
     for k in range(min(3, len(f_ins))):
         f_ins_arr[k] = float(f_ins[k])
 
+    # Voxel-level intra/extra orientation weights (scaled by wm_fraction so
+    # each sums to the compartment's true volume fraction).  These, together
+    # with wm_d_par / wm_d_perp_raw / gm_d_par / csf_d_par and the tissue
+    # fractions, fully determine the Gaussian mixture and are consumed by
+    # dipy.sims._force_moments for analytic DTI/DKI/MAP-MRI (no signal fit).
+    intra_odf_vox = (wm_fraction * np.asarray(wm_intra_odf)).astype(np.float32)
+    extra_odf_vox = (wm_fraction * np.asarray(wm_extra_odf)).astype(np.float32)
+
     return (
         combined_signal,
         wm_label,
@@ -878,4 +913,7 @@ cpdef tuple create_mixed_signal(
         float(gm_d_par),
         float(csf_d_par),
         f_ins_arr,
+        intra_odf_vox,
+        extra_odf_vox,
+        float(wm_d_perp_raw),
     )

@@ -469,7 +469,29 @@ MICRO_PARAMS = (
     "ak",
     "rk",
     "mk",
+    "mkt",
     "kfa",
+    "rtop",
+    "rtap",
+    "rtpp",
+    "msd",
+    "qiv",
+    "ng",
+    "ngpar",
+    "ngperp",
+    "pa",
+    "micro_fa",
+    "coherence",
+    "k_bulk",
+    "k_shear",
+)
+
+# MAP-MRI/SHORE + NG/PA + QTI scalars optionally stored in the library. Which
+# subset is present depends on compute_mapmri / mapmri_method / compute_ng /
+# compute_qti, so callers copy only the keys actually present.
+MAPMRI_PARAMS = (
+    "rtop", "rtap", "rtpp", "msd", "qiv", "ng", "ngpar", "ngperp", "pa",
+    "micro_fa", "coherence", "k_bulk", "k_shear",
 )
 
 
@@ -712,6 +734,15 @@ class FORCEModel(ReconstModel):
         diffusivity_config=None,
         compute_dti=True,
         compute_dki=False,
+        compute_mapmri=False,
+        compute_ng=False,
+        compute_qti=False,
+        metric_method="canonical",
+        mapmri_method="closed_form",
+        mapmri_fit_model="mapmri",
+        mapmri_canonical_bvals=(1000.0, 2000.0, 3000.0, 4000.0),
+        intra_dperp_floor=0.12e-3,
+        canonical_bvals=(1000.0, 2000.0),
         verbose=False,
         use_cache=True,
     ):
@@ -750,6 +781,35 @@ class FORCEModel(ReconstModel):
             Compute DTI metrics (FA, MD, RD).
         compute_dki : bool, optional
             Compute DKI metrics (AK, RK, MK, KFA).
+        compute_mapmri : bool, optional
+            Compute MAP-MRI q-space scalars (RTOP, RTAP, RTPP, MSD, QIV).
+        compute_ng : bool, optional
+            Compute closed-form non-Gaussianity (ng, ngpar, ngperp) and
+            propagator anisotropy (pa) from the Gaussian mixture.
+        compute_qti : bool, optional
+            Compute closed-form QTI/DIVIDE invariants (micro_fa, coherence,
+            k_bulk, k_shear) from the mixture covariance.
+        mapmri_method : {'closed_form', 'canonical', 'signal'}, optional
+            How MAP-MRI/SHORE scalars are obtained: closed-form EAP moments
+            (default), or a ``mapmri_fit_model`` fit to a synthetic canonical
+            multi-shell signal (``'canonical'``) or to the acquisition signal
+            (``'signal'``). See
+            :func:`dipy.sims.force.generate_force_simulations`.
+        mapmri_fit_model : {'mapmri', 'shore'}, optional
+            dipy model to fit when ``mapmri_method`` is not ``'closed_form'``.
+        mapmri_canonical_bvals : tuple of float, optional
+            b-values of the canonical q-space scheme for MAP-MRI fitting.
+        metric_method : {'canonical', 'cumulant', 'signal'}, optional
+            How stored DTI/DKI scalars are computed. ``'canonical'`` (default)
+            and ``'cumulant'`` are analytic and work for any sampling scheme
+            (including single-shell); ``'signal'`` is the legacy shell-based
+            fit. See :func:`dipy.sims.force.generate_force_simulations`.
+        intra_dperp_floor : float, optional
+            Intra-axonal radial-diffusivity floor for the singular MAP-MRI
+            indices (does not affect the stored signal).
+        canonical_bvals : tuple of float, optional
+            b-values of the fixed canonical scheme for ``metric_method``
+            ``'canonical'``.
         verbose : bool, optional
             Enable progress output.
         use_cache : bool, optional
@@ -766,11 +826,16 @@ class FORCEModel(ReconstModel):
         unique_bvals = unique_bvals_tolerance(self.gtab.bvals, tol=50)
         n_nonzero_shells = int(np.sum(unique_bvals > b0_thr))
 
-        if compute_dki and n_nonzero_shells < 2:
+        # The >=2-shell requirement only applies to the legacy signal-fit path.
+        # The analytic methods ('canonical'/'cumulant') compute DKI from the
+        # known mixture and work for any scheme, including single-shell.
+        if compute_dki and metric_method == "signal" and n_nonzero_shells < 2:
             warnings.warn(
-                f"compute_dki=True but only {n_nonzero_shells} non-zero "
-                "b-value shell found (need at least 2). "
-                "Disabling DKI computation.",
+                f"compute_dki=True with metric_method='signal' but only "
+                f"{n_nonzero_shells} non-zero b-value shell found (need at "
+                "least 2). Disabling DKI computation. Use "
+                "metric_method='canonical' or 'cumulant' to compute DKI on "
+                "non-shelled / single-shell data.",
                 UserWarning,
                 stacklevel=2,
             )
@@ -816,6 +881,15 @@ class FORCEModel(ReconstModel):
             diffusivity_config=diffusivity_config,
             compute_dti=compute_dti,
             compute_dki=compute_dki,
+            compute_mapmri=compute_mapmri,
+            compute_ng=compute_ng,
+            compute_qti=compute_qti,
+            metric_method=metric_method,
+            mapmri_method=mapmri_method,
+            mapmri_fit_model=mapmri_fit_model,
+            mapmri_canonical_bvals=mapmri_canonical_bvals,
+            intra_dperp_floor=intra_dperp_floor,
+            canonical_bvals=canonical_bvals,
             verbose=verbose,
         )
 
@@ -929,7 +1003,11 @@ class FORCEModel(ReconstModel):
             params["ak"] = d["ak"][lib_idx].astype(np.float32)
             params["rk"] = d["rk"][lib_idx].astype(np.float32)
             params["mk"] = d["mk"][lib_idx].astype(np.float32)
+            params["mkt"] = d["mkt"][lib_idx].astype(np.float32)
             params["kfa"] = d["kfa"][lib_idx].astype(np.float32)
+        for key in MAPMRI_PARAMS:
+            if key in d:
+                params[key] = d[key][lib_idx].astype(np.float32)
         params["odf"] = d["odfs"][lib_idx].astype(np.float32) if "odfs" in d else None
         params["predicted_signal"] = d["signals"][lib_idx].astype(np.float32)
         return params
@@ -977,7 +1055,11 @@ class FORCEModel(ReconstModel):
             params["ak"] = _wavg("ak")
             params["rk"] = _wavg("rk")
             params["mk"] = _wavg("mk")
+            params["mkt"] = _wavg("mkt")
             params["kfa"] = _wavg("kfa")
+        for key in MAPMRI_PARAMS:
+            if key in d:
+                params[key] = _wavg(key)
 
         # Posterior ODF
         if "odfs" in d:
@@ -1210,9 +1292,79 @@ class FORCEFit(ReconstFit):
         return self._params.get("mk", None)
 
     @property
+    def mkt(self):
+        """Mean kurtosis tensor (DKI) - smoother mean-kurtosis measure than mk."""
+        return self._params.get("mkt", None)
+
+    @property
     def kfa(self):
         """Kurtosis fractional anisotropy (DKI)."""
         return self._params.get("kfa", None)
+
+    @property
+    def rtop(self):
+        """Return-to-origin probability (MAP-MRI)."""
+        return self._params.get("rtop", None)
+
+    @property
+    def rtap(self):
+        """Return-to-axis probability (MAP-MRI)."""
+        return self._params.get("rtap", None)
+
+    @property
+    def rtpp(self):
+        """Return-to-plane probability (MAP-MRI)."""
+        return self._params.get("rtpp", None)
+
+    @property
+    def msd(self):
+        """Mean squared displacement (MAP-MRI)."""
+        return self._params.get("msd", None)
+
+    @property
+    def qiv(self):
+        """Q-space inverse variance (MAP-MRI)."""
+        return self._params.get("qiv", None)
+
+    @property
+    def ng(self):
+        """Non-Gaussianity (from compute_ng, or a MAP-MRI fit)."""
+        return self._params.get("ng", None)
+
+    @property
+    def ngpar(self):
+        """Parallel (axial) non-Gaussianity (from compute_ng or a MAP-MRI fit)."""
+        return self._params.get("ngpar", None)
+
+    @property
+    def ngperp(self):
+        """Perpendicular non-Gaussianity (restriction marker)."""
+        return self._params.get("ngperp", None)
+
+    @property
+    def pa(self):
+        """Propagator anisotropy (directional coherence; from compute_ng)."""
+        return self._params.get("pa", None)
+
+    @property
+    def micro_fa(self):
+        """Microscopic FA / uFA (QTI; dispersion-invariant, from compute_qti)."""
+        return self._params.get("micro_fa", None)
+
+    @property
+    def coherence(self):
+        """Microscopic orientation coherence C_c (QTI; ~1 single fibre, <1 crossing)."""
+        return self._params.get("coherence", None)
+
+    @property
+    def k_bulk(self):
+        """Isotropic (free-water/size) kurtosis (QTI; from compute_qti)."""
+        return self._params.get("k_bulk", None)
+
+    @property
+    def k_shear(self):
+        """Anisotropic (fibre/shape) kurtosis (QTI; from compute_qti)."""
+        return self._params.get("k_shear", None)
 
     @property
     def odf(self):
