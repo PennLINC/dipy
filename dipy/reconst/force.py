@@ -2,6 +2,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 import warnings
 
 import numpy as np
@@ -27,14 +28,20 @@ EPSILON = 1e-12
 def _get_force_cache_dir():
     """Return the FORCE simulation cache directory inside .dipy.
 
-    Uses ``DIPY_HOME`` environment variable if set, otherwise defaults
-    to ``~/.dipy/force_simulations``.
+    Resolution order: ``DIPY_FORCE_CACHE_DIR`` (used verbatim) takes precedence
+    so a caller can give each process a private cache and avoid contention on a
+    shared registry; otherwise ``DIPY_HOME``/force_simulations if ``DIPY_HOME``
+    is set; otherwise ``~/.dipy/force_simulations``.
 
     Returns
     -------
     cache_dir : Path
         Path to the cache directory (created if it does not exist).
     """
+    if "DIPY_FORCE_CACHE_DIR" in os.environ:
+        cache_dir = Path(os.environ["DIPY_FORCE_CACHE_DIR"])
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir
     if "DIPY_HOME" in os.environ:
         dipy_home = Path(os.environ["DIPY_HOME"])
     else:
@@ -127,14 +134,38 @@ def _load_cache_registry(cache_dir):
 
 
 def _save_cache_registry(cache_dir, registry):
-    """Persist *registry* as JSON in *cache_dir*."""
+    """Atomically persist *registry* as JSON in *cache_dir*.
+
+    Serialise to a temporary file in the same directory, flush + fsync, then
+    ``os.replace`` it onto ``cache_registry.json``. ``os.replace`` is atomic
+    within a filesystem, so a concurrent writer or a process killed mid-write
+    can never leave a half-written registry with trailing bytes (the
+    ``json.JSONDecodeError: Extra data`` seen when many cluster jobs shared one
+    registry). Pairs with the cross-node lock in ``_locked_registry_update``.
+    """
     registry_path = cache_dir / "cache_registry.json"
-    with open(registry_path, "w") as f:
-        json.dump(registry, f, indent=2)
+    fd, tmp = tempfile.mkstemp(
+        dir=str(cache_dir), prefix=".cache_registry.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(registry, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, registry_path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
 def _locked_registry_update(cache_dir, update_fn):
     """Read-modify-write the cache registry under an exclusive file lock.
+
+    On Unix the lock uses POSIX ``fcntl.lockf`` (not BSD ``flock``): ``flock``
+    is only node-local on clustered filesystems like GPFS/NFS, so jobs on
+    different nodes would not actually exclude one another and their writes
+    interleaved into a corrupt registry. ``lockf`` maps to ``fcntl(F_SETLKW)``
+    byte-range locks, which those filesystems honour across nodes.
 
     Parameters
     ----------
@@ -160,13 +191,13 @@ def _locked_registry_update(cache_dir, update_fn):
         else:
             import fcntl
 
-            fcntl.flock(lock_fh, fcntl.LOCK_EX)
+            fcntl.lockf(lock_fh, fcntl.LOCK_EX)
             try:
                 registry = _load_cache_registry(cache_dir)
                 registry = update_fn(registry)
                 _save_cache_registry(cache_dir, registry)
             finally:
-                fcntl.flock(lock_fh, fcntl.LOCK_UN)
+                fcntl.lockf(lock_fh, fcntl.LOCK_UN)
 
 
 def _find_cached_simulation(cache_dir, gtab, diffusivity_config, num_simulations):
