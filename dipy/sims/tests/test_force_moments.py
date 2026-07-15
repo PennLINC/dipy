@@ -16,12 +16,16 @@ from dipy.data import default_sphere, get_sphere
 from dipy.reconst import dki, dti, mapmri
 from dipy.reconst.dki import apparent_kurtosis_coef
 from dipy.sims._force_moments import (
+    RSI_KEYS,
+    GQI_KEYS,
     dki_params_from_moments,
     dki_params_from_tensor_distribution,
     gaussian_mixture_ng_pa,
+    gqi_indices_from_odfs,
     mapmri_closed_form_indices,
     moments_from_odfs,
     qti_indices_from_moments,
+    rsi_indices_from_signals,
     synth_signal_from_odfs,
 )
 from dipy.sims.force import generate_force_simulations
@@ -362,6 +366,274 @@ def test_generate_compute_qti():
         assert k in sims and np.all(np.isfinite(sims[k])), k
     assert np.all((sims["micro_fa"] >= 0) & (sims["micro_fa"] <= 1.001))
     assert np.all((sims["coherence"] >= 0) & (sims["coherence"] <= 1.001))
+
+
+def _abcd_reference_rsi(signals, gtab):
+    """Independent re-implementation of the ABCD ``RSIproc`` estimator using
+    ``scipy.special.sph_harm`` (the reference's own basis) on the same vendored
+    icosphere, so the test does not depend on the production real-SH convention.
+    Returns the same dict of keys as ``rsi_indices_from_signals``."""
+    from dipy.sims._force_moments import _rsi_icosahedron, RSI_COMPARTMENTS
+    try:                                    # scipy >= 1.15 renamed sph_harm
+        from scipy.special import sph_harm_y
+
+        def _Y(m, l, az, pol):
+            return sph_harm_y(l, m, pol, az)
+    except ImportError:
+        from scipy.special import sph_harm
+
+        def _Y(m, l, az, pol):
+            return sph_harm(m, l, az, pol)
+
+    def yl(l, ml, x):                       # RSIproc YLeval
+        pol = np.arccos(x[2]); az = np.arctan2(x[1], x[0])
+        az = az + (az < 0) * 2 * np.pi
+        y = _Y(abs(ml), l, az, pol)
+        if ml < 0:
+            return np.sqrt(2) * y.real
+        if ml == 0:
+            return y.real
+        return np.sqrt(2) * y.imag
+
+    X = _rsi_icosahedron(3); M = X.shape[0]
+    orders = [c[3] for c in RSI_COMPARTMENTS]
+    max_order = max(orders)
+    nshmax = (max_order + 2) * (max_order + 1) // 2
+    YL = np.zeros((M, nshmax))
+    l_of_p = np.zeros(nshmax, int)              # RSIproc even-l contiguous packing
+    for l in range(0, max_order + 2, 2):
+        for ml in range(-l, l + 1):
+            p = (l * l + l) // 2 + ml
+            YL[:, p] = [yl(l, ml, X[m]) for m in range(M)]
+            l_of_p[p] = l
+    bvals = np.asarray(gtab.bvals, float); bvecs = np.asarray(gtab.bvecs, float)
+    Ls, cids, blocks = [], [], []
+    for ci, (_, DL, DT, sho) in enumerate(RSI_COMPARTMENTS):
+        nsh = (sho + 2) * (sho + 1) // 2
+        R = np.exp(-bvals[:, None] * (DT + (DL - DT) * (bvecs @ X.T) ** 2))
+        blocks.append(R @ np.linalg.pinv(YL[:, :nsh]).T)
+        Ls.append(l_of_p[:nsh]); cids.append(np.full(nsh, ci))
+    A = np.hstack(blocks) * YL[0, 0]
+    L = np.concatenate(Ls); cid = np.concatenate(cids)
+    AtA = A.T @ A
+    W = np.linalg.solve(AtA + 0.1 * np.mean(np.diag(AtA)) * np.eye(A.shape[1]), A.T)
+    b0 = bvals <= 50
+    S0 = signals[:, b0].mean(1)
+    beta = (signals / np.maximum(S0, 1e-9)[:, None]) @ W.T
+    out = {}
+    names = ["r", "h", "f"]
+    for ci, nm in enumerate(names):
+        b = beta[:, cid == ci]; li = L[cid == ci]
+        n0 = np.clip(b[:, li == 0][:, 0], -1, 2)
+        nd = np.linalg.norm(b[:, li > 0], axis=1) if np.any(li > 0) else np.zeros(len(b))
+        nt = np.linalg.norm(b, axis=1)
+        out[nm] = (n0, nd, nt)
+    r, h, f = out["r"], out["h"], out["f"]
+    return {"rnt": r[2], "rn0": r[0], "rnd": r[1],
+            "hnt": h[2], "hn0": h[0], "hnd": h[1], "fnt": f[2]}
+
+
+def test_rsi_indices_match_abcd_and_generate():
+    """RSI reproduces the ABCD RSIproc convention: the production estimator
+    matches an independent scipy-``sph_harm`` re-implementation of RSIproc, the
+    stored ``compute_rsi`` columns equal the direct projection, and per
+    compartment ``NT**2 = N0**2 + ND**2``."""
+    gtab = _multishell_gtab([500, 1000, 2000, 3000], n_dir=60, seed=3)
+    sims = generate_force_simulations(
+        gtab, num_simulations=40, num_cpus=1, verbose=False,
+        compute_dti=False, compute_dki=False, compute_rsi=True,
+    )
+    for k in RSI_KEYS:
+        assert k in sims and np.all(np.isfinite(sims[k])), k
+    # ranges: N0 clipped to [-1, 2]; NT/ND are non-negative norms
+    for k in ("rn0", "hn0"):
+        assert np.all((sims[k] >= -1.0001) & (sims[k] <= 2.0001)), k
+    for k in ("rnt", "rnd", "hnt", "hnd", "fnt"):
+        assert np.all(sims[k] >= -1e-9), k
+    # NT**2 = N0**2 + ND**2 per directional compartment
+    assert np.allclose(sims["rnt"] ** 2, sims["rn0"] ** 2 + sims["rnd"] ** 2, atol=1e-5)
+    assert np.allclose(sims["hnt"] ** 2, sims["hn0"] ** 2 + sims["hnd"] ** 2, atol=1e-5)
+    # stored (exact) == direct projection of the same signals
+    r = rsi_indices_from_signals(sims["signals"], gtab)
+    for k in RSI_KEYS:
+        assert np.allclose(sims[k], r[k], atol=1e-5), k
+    # production real-SH estimator == independent scipy-sph_harm ABCD reference
+    ref = _abcd_reference_rsi(np.asarray(sims["signals"], float), gtab)
+    for k in RSI_KEYS:
+        assert_allclose(r[k], ref[k], atol=2e-4, rtol=2e-3,
+                        err_msg=f"{k} differs from ABCD RSIproc reference")
+
+
+def test_rish_features_rotation_invariance():
+    """RISH per-shell SH power is far more rotation-stable than the raw signal:
+    rotating the microstructure leaves RISH ~unchanged while the raw signal moves
+    substantially. Also checks generate stores the columns."""
+    from dipy.sims._force_moments import (rish_features_from_signals,
+                                           synth_signal_from_odfs)
+    sph = get_sphere(name="repulsion724")
+    verts = np.asarray(sph.vertices, float)
+    gtab = _multishell_gtab([1000, 2000, 3000], n_dir=60, seed=2)
+    bvals, bvecs = np.asarray(gtab.bvals), np.asarray(gtab.bvecs)
+
+    def watson(u, odi, frac):
+        k = 1.0 / np.tan(np.pi / 2 * odi)
+        w = np.exp(k * (verts @ u) ** 2)
+        return frac * w / w.sum()
+
+    def rot(seed):
+        q, _ = np.linalg.qr(np.random.default_rng(seed).standard_normal((3, 3)))
+        return q * np.sign(np.linalg.det(q))
+
+    args = (2.2e-3, 0.6e-3, 0.18, 1.0e-3, 0.12, 3.0e-3)
+    u1 = np.array([0, 0, 1.0]); u2 = np.array([np.sin(1.0), 0, np.cos(1.0)])
+
+    def build(R):
+        io = (watson(R @ u1, 0.1, 0.3) + watson(R @ u2, 0.1, 0.2))[None]
+        eo = (watson(R @ u1, 0.1, 0.12) + watson(R @ u2, 0.1, 0.08))[None]
+        return synth_signal_from_odfs(io, eo, verts, *args, bvals, bvecs)
+
+    S0 = build(np.eye(3))
+    base = rish_features_from_signals(S0, gtab)
+    feats, cos = {k: [float(base[k])] for k in base}, []
+    for s in range(1, 12):
+        Sr = build(rot(s))
+        r = rish_features_from_signals(Sr, gtab)
+        for k in feats:
+            feats[k].append(float(r[k]))
+        cos.append(float(S0 @ Sr.T / (np.linalg.norm(S0) * np.linalg.norm(Sr))))
+    # low-order RISH power (l<=2) barely moves; the raw signal moves a lot
+    lo_spread = max(np.std(feats[k]) / (abs(np.mean(feats[k])) + 1e-9)
+                    for k in feats if k.endswith(("l0", "l2")))
+    raw_move = 1.0 - np.mean(cos)
+    assert lo_spread < 0.06                     # RISH l<=2 stable under rotation
+    assert raw_move > lo_spread                 # raw signal moves more than RISH
+
+    sims = generate_force_simulations(gtab, num_simulations=20, num_cpus=1,
+                                      verbose=False, compute_dti=True,
+                                      compute_rish=True)
+    rk = [k for k in sims if k.startswith("rish_")]
+    assert len(rk) >= 6 and all(np.all(np.isfinite(sims[k])) for k in rk)
+
+
+def test_num_fiber_probs():
+    """num_fiber_probs re-weights the WM fibre-count mix (default unchanged)."""
+    gtab = _multishell_gtab([1000, 2000], n_dir=24, seed=1)
+    common = dict(num_simulations=1500, num_cpus=1, verbose=False, compute_dti=True)
+    # default is 3-fibre-heavy
+    d = generate_force_simulations(gtab, **common)
+    nf = np.asarray(d["num_fibers"])
+    assert (nf == 3).mean() > (nf == 2).mean()          # default favours 3 fibres
+    # rebalanced toward 2-fibre crossings
+    r = generate_force_simulations(gtab, num_fiber_probs=(0.15, 0.6, 0.25), **common)
+    nf2 = np.asarray(r["num_fibers"])
+    assert (nf2 == 2).mean() > 0.45 and (nf2 == 2).mean() > (nf == 2).mean()
+    # pure two-fibre
+    p2 = generate_force_simulations(gtab, num_fiber_probs=(0, 1, 0), **common)
+    assert np.all(np.asarray(p2["num_fibers"]) == 2)
+
+
+def test_soma_compartment():
+    """The optional soma/dot compartment: off by default (no regression), and
+    when on it is an exact 4th isotropic Gaussian -- weights still sum to 1, the
+    mixture dilutes MD, and RSI's restricted-isotropic term (rn0) picks it up."""
+    gtab = _multishell_gtab([1000, 2000, 3000], n_dir=50, seed=11)
+    kw = dict(num_simulations=250, num_cpus=1, verbose=False,
+              compute_dti=True, compute_dki=True, metric_method="cumulant",
+              compute_mapmri=True, compute_qti=True, compute_rsi=True)
+
+    np.random.seed(3)
+    off = generate_force_simulations(gtab, **kw)
+    np.random.seed(3)
+    on = generate_force_simulations(gtab, include_soma=True, **kw)
+
+    # off by default -> no soma columns, behaviour unchanged
+    assert "soma_fraction" not in off and "soma_d" not in off
+    assert "soma_fraction" in on and "soma_d" in on
+
+    fs = np.asarray(on["soma_fraction"])
+    # the mixture is still a valid partition of unity
+    total = (np.asarray(on["wm_fraction"]) + np.asarray(on["gm_fraction"])
+             + np.asarray(on["csf_fraction"]) + fs)
+    assert_allclose(total, 1.0, atol=1e-5)
+    # every analytic scalar stays finite with the extra compartment
+    for k in ("fa", "md", "rd", "mk", "rtop", "rtap", "msd", "qiv",
+              "micro_fa", "rn0", "rnt", "fnt"):
+        assert np.all(np.isfinite(on[k])), k
+
+    # a low-diffusivity isotropic compartment must pull MD down ...
+    assert np.corrcoef(fs, np.asarray(on["md"]))[0, 1] < -0.15
+    # ... and show up in RSI's restricted-ISOTROPIC term, which is the whole
+    # point of adding it (it otherwise has no generative counterpart).
+    assert np.corrcoef(fs, np.asarray(on["rn0"]))[0, 1] > 0.25
+
+
+def test_soma_moments_match_explicit_mixture():
+    """moments_from_odfs with a soma compartment equals an explicit 4-compartment
+    tensor distribution (the soma term is exact, not an approximation)."""
+    rng = np.random.default_rng(0)
+    verts = np.asarray(get_sphere(name="repulsion724").vertices, float)
+    n_v = len(verts)
+    io = np.zeros((1, n_v)); eo = np.zeros((1, n_v))
+    idx = rng.choice(n_v, 4, replace=False)
+    io[0, idx] = [0.10, 0.06, 0.04, 0.02]      # intra weights
+    eo[0, idx] = [0.05, 0.03, 0.02, 0.01]      # extra weights
+    d_par, d_perp = 2.2e-3, 0.6e-3
+    gm_f, gm_d, csf_f, csf_d = 0.15, 1.0e-3, 0.12, 3.0e-3
+    soma_f, soma_d = 1.0 - (io.sum() + eo.sum() + gm_f + csf_f), 0.3e-3
+    assert soma_f > 0
+
+    D_app, C = moments_from_odfs(io, eo, verts, d_par, d_perp,
+                                 gm_f, gm_d, csf_f, csf_d,
+                                 soma_frac=soma_f, soma_d=soma_d)
+    # explicit reference mixture
+    w, T = [], []
+    for i in idx:
+        v = verts[i]; vv = np.outer(v, v)
+        w.append(io[0, i]); T.append(d_par * vv)
+        w.append(eo[0, i]); T.append(d_perp * np.eye(3) + (d_par - d_perp) * vv)
+    for f, d in ((gm_f, gm_d), (csf_f, csf_d), (soma_f, soma_d)):
+        w.append(f); T.append(d * np.eye(3))
+    w = np.asarray(w); T = np.asarray(T)
+    assert_allclose(w.sum(), 1.0, atol=1e-8)
+    D_ref = np.einsum("c,cij->ij", w, T)
+    DD_ref = np.einsum("c,cij,ckl->ijkl", w, T, T)
+    C_ref = DD_ref - np.einsum("ij,kl->ijkl", D_ref, D_ref)
+    assert_allclose(D_app[0], D_ref, atol=1e-12)
+    assert_allclose(C[0], C_ref, atol=1e-14)
+
+
+def test_gqi_indices_archetypes_and_generate():
+    """GQI GFA/QA: isotropic ODF -> 0, sharp single-peak -> high GFA, and QA
+    grows with peak sharpness; compute_gqi stores finite in-range measures."""
+    n_vert = 200
+    rng = np.random.default_rng(0)
+    verts = rng.standard_normal((n_vert, 3))
+    verts /= np.linalg.norm(verts, axis=1, keepdims=True)
+    # isotropic ODF (all WM) -> GFA/QA ~ 0
+    iso = np.ones((1, n_vert))
+    g_iso = gqi_indices_from_odfs(iso, np.array([1.0]))
+    assert g_iso["gfa"][0] < 1e-6 and g_iso["qa"][0] < 1e-6
+    # increasingly sharp single peak (all WM) -> GFA and QA increase monotonically
+    axis = np.array([0.0, 0.0, 1.0])
+    cos = verts @ axis
+    odfs = np.stack([np.exp(kappa * cos**2) for kappa in (1.0, 5.0, 20.0)])
+    g = gqi_indices_from_odfs(odfs, np.ones(3))
+    assert np.all(np.diff(g["gfa"]) > 0) and np.all(np.diff(g["qa"]) > 0)
+    # free-water dilution: same sharp ODF with low WM fraction -> lower GFA
+    sharp = odfs[-1:][None, 0]
+    g_hi = gqi_indices_from_odfs(sharp, np.array([1.0]))["gfa"][0]
+    g_lo = gqi_indices_from_odfs(sharp, np.array([0.2]))["gfa"][0]
+    assert g_lo < g_hi
+
+    gtab = _multishell_gtab([1000, 2000, 3000], n_dir=40, seed=5)
+    sims = generate_force_simulations(
+        gtab, num_simulations=30, num_cpus=1, verbose=False,
+        compute_dti=True, compute_dki=False, compute_gqi=True,
+    )
+    for k in GQI_KEYS:
+        assert k in sims and np.all(np.isfinite(sims[k])), k
+    assert np.all((sims["gfa"] >= -1e-9) & (sims["gfa"] <= 1.0001))
+    assert np.all(sims["qa"] >= -1e-9)
 
 
 def test_generate_signal_method_shelled():

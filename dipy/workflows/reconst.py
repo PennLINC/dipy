@@ -3466,6 +3466,8 @@ class ReconstForceFlow(Workflow):
         compute_mapmri=False,
         compute_ng=False,
         compute_qti=False,
+        compute_rsi=False,
+        compute_gqi=False,
         metric_method="canonical",
         mapmri_method="closed_form",
         mapmri_fit_model="mapmri",
@@ -3503,6 +3505,15 @@ class ReconstForceFlow(Workflow):
         out_coherence="coherence.nii.gz",
         out_k_bulk="k_bulk.nii.gz",
         out_k_shear="k_shear.nii.gz",
+        out_rnt="rnt.nii.gz",
+        out_rn0="rn0.nii.gz",
+        out_rnd="rnd.nii.gz",
+        out_hnt="hnt.nii.gz",
+        out_hn0="hn0.nii.gz",
+        out_hnd="hnd.nii.gz",
+        out_fnt="fnt.nii.gz",
+        out_gfa="gfa.nii.gz",
+        out_qa="qa.nii.gz",
         out_entropy="entropy.nii.gz",
         out_predicted_signal="predicted_signal.nii.gz",
         out_peaks="peaks.pam5",
@@ -3569,6 +3580,11 @@ class ReconstForceFlow(Workflow):
         compute_qti : bool, optional
             Compute closed-form QTI/DIVIDE invariants (micro_fa, coherence,
             k_bulk, k_shear) from the mixture covariance.
+        compute_rsi : bool, optional
+            Compute ABCD-style directional RSI measures (rnt/rn0/rnd, hnt/hn0/hnd,
+            fnt) by exact fixed-basis projection of the library signals.
+        compute_gqi : bool, optional
+            Compute GQI ODF-shape statistics (gfa, qa) from the mixture ODF.
         metric_method : string, optional
             How DTI/DKI scalars are computed: 'canonical' (default) and
             'cumulant' are analytic and work for any sampling scheme (including
@@ -3649,6 +3665,17 @@ class ReconstForceFlow(Workflow):
         out_k_shear : string, optional
             Name of the anisotropic (fibre) kurtosis volume (requires
             compute_qti).
+        out_rnt, out_rn0, out_rnd : string, optional
+            Names of the RSI restricted total / isotropic / directional volumes
+            (require compute_rsi).
+        out_hnt, out_hn0, out_hnd : string, optional
+            Names of the RSI hindered total / isotropic / directional volumes
+            (require compute_rsi).
+        out_fnt : string, optional
+            Name of the RSI free-water total volume (requires compute_rsi).
+        out_gfa, out_qa : string, optional
+            Names of the GQI generalized/quantitative anisotropy volumes
+            (require compute_gqi).
         out_entropy : string, optional
             Name of the entropy volume to be saved (requires use_posterior).
         out_predicted_signal : string, optional
@@ -3723,6 +3750,15 @@ class ReconstForceFlow(Workflow):
             ocoherence,
             ok_bulk,
             ok_shear,
+            ornt,
+            orn0,
+            ornd,
+            ohnt,
+            ohn0,
+            ohnd,
+            ofnt,
+            ogfa,
+            oqa,
             oentropy,
             opredicted_signal,
             opeaks,
@@ -3762,6 +3798,8 @@ class ReconstForceFlow(Workflow):
                 compute_mapmri=compute_mapmri,
                 compute_ng=compute_ng,
                 compute_qti=compute_qti,
+                compute_rsi=compute_rsi,
+                compute_gqi=compute_gqi,
                 metric_method=metric_method,
                 mapmri_method=mapmri_method,
                 mapmri_fit_model=mapmri_fit_model,
@@ -3812,6 +3850,12 @@ class ReconstForceFlow(Workflow):
                 conditional_metrics.extend(
                     ["micro_fa", "coherence", "k_bulk", "k_shear"]
                 )
+            if compute_rsi:
+                conditional_metrics.extend(
+                    ["rnt", "rn0", "rnd", "hnt", "hn0", "hnd", "fnt"]
+                )
+            if compute_gqi:
+                conditional_metrics.extend(["gfa", "qa"])
             if use_posterior:
                 conditional_metrics.append("entropy")
 
@@ -3848,6 +3892,15 @@ class ReconstForceFlow(Workflow):
                 "coherence": (ocoherence, force_fit.coherence),
                 "k_bulk": (ok_bulk, force_fit.k_bulk),
                 "k_shear": (ok_shear, force_fit.k_shear),
+                "rnt": (ornt, force_fit.rnt),
+                "rn0": (orn0, force_fit.rn0),
+                "rnd": (ornd, force_fit.rnd),
+                "hnt": (ohnt, force_fit.hnt),
+                "hn0": (ohn0, force_fit.hn0),
+                "hnd": (ohnd, force_fit.hnd),
+                "fnt": (ofnt, force_fit.fnt),
+                "gfa": (ogfa, force_fit.gfa),
+                "qa": (oqa, force_fit.qa),
                 "entropy": (oentropy, force_fit.entropy),
                 "predicted_signal": (opredicted_signal, force_fit.predicted_signal),
             }

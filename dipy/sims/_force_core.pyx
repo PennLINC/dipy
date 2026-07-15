@@ -26,6 +26,12 @@ cdef double GM_D_MIN = 0.7e-3
 cdef double GM_D_MAX = 1.2e-3
 cdef double CSF_D = 3.0e-3
 
+# Probabilities of drawing a 1-, 2-, or 3-fibre white-matter configuration.
+# The default is heavily weighted to 3 fibres; rebalancing toward 2 fibres
+# markedly improves crossing-fibre ODF fidelity (2-fibre crossings are otherwise
+# thinly covered in the library).  Set via set_fiber_probs().
+FIBER_PROBS = np.array([0.1, 0.2, 0.7], dtype=np.float64)
+
 
 def set_diffusivity_ranges(
     wm_d_par_range=(2.0e-3, 3.0e-3),
@@ -67,6 +73,23 @@ def set_diffusivity_ranges(
     WM_D_PERP_MIN, WM_D_PERP_MAX = _validate_val_or_pair("wm_d_perp_range", wm_d_perp_range)
     GM_D_MIN, GM_D_MAX = _validate_val_or_pair("gm_d_iso_range", gm_d_iso_range)
     CSF_D = float(csf_d)
+
+
+def set_fiber_probs(fiber_probs=(0.1, 0.2, 0.7)):
+    """Set the probabilities of drawing a 1-, 2-, or 3-fibre configuration.
+
+    Parameters
+    ----------
+    fiber_probs : sequence of 3 floats
+        Probabilities for (1, 2, 3) fibres; must be non-negative and are
+        renormalized to sum to 1.  The default ``(0.1, 0.2, 0.7)`` is
+        3-fibre-heavy; e.g. ``(0.2, 0.5, 0.3)`` emphasizes crossings.
+    """
+    global FIBER_PROBS
+    p = np.asarray(fiber_probs, dtype=np.float64)
+    if p.shape != (3,) or np.any(p < 0) or p.sum() <= 0:
+        raise ValueError("fiber_probs must be 3 non-negative values summing > 0")
+    FIBER_PROBS = p / p.sum()
 
 
 cdef inline double get_dperp_extra(double d_par, double f_intra) noexcept:
@@ -817,7 +840,7 @@ cpdef tuple create_mixed_signal(
     gm_fraction = float(fractions[1])
     csf_fraction = float(fractions[2])
 
-    num_fiber = int(np.random.choice([1, 2, 3], p=[0.1, 0.2, 0.7]))
+    num_fiber = int(np.random.choice([1, 2, 3], p=FIBER_PROBS))
 
     wm_result = create_wm_signal(
         num_fiber,

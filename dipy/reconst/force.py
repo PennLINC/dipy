@@ -515,14 +515,23 @@ MICRO_PARAMS = (
     "coherence",
     "k_bulk",
     "k_shear",
+    "rnt",
+    "rn0",
+    "rnd",
+    "hnt",
+    "hn0",
+    "hnd",
+    "fnt",
 )
 
-# MAP-MRI/SHORE + NG/PA + QTI scalars optionally stored in the library. Which
-# subset is present depends on compute_mapmri / mapmri_method / compute_ng /
-# compute_qti, so callers copy only the keys actually present.
+# MAP-MRI/SHORE + NG/PA + QTI + RSI scalars optionally stored in the library.
+# Which subset is present depends on the compute_* flags, so callers copy only
+# the keys actually present.
 MAPMRI_PARAMS = (
     "rtop", "rtap", "rtpp", "msd", "qiv", "ng", "ngpar", "ngperp", "pa",
     "micro_fa", "coherence", "k_bulk", "k_shear",
+    "rnt", "rn0", "rnd", "hnt", "hn0", "hnd", "fnt",
+    "gfa", "qa",
 )
 
 
@@ -768,6 +777,8 @@ class FORCEModel(ReconstModel):
         compute_mapmri=False,
         compute_ng=False,
         compute_qti=False,
+        compute_rsi=False,
+        compute_gqi=False,
         metric_method="canonical",
         mapmri_method="closed_form",
         mapmri_fit_model="mapmri",
@@ -820,6 +831,12 @@ class FORCEModel(ReconstModel):
         compute_qti : bool, optional
             Compute closed-form QTI/DIVIDE invariants (micro_fa, coherence,
             k_bulk, k_shear) from the mixture covariance.
+        compute_rsi : bool, optional
+            Compute ABCD-style directional RSI measures (rnt/rn0/rnd, hnt/hn0/hnd,
+            fnt) by exact fixed-basis projection of the library signals.
+        compute_gqi : bool, optional
+            Compute GQI ODF-shape statistics (gfa, qa) from the mixture ODF
+            (free-water-diluted generalized/quantitative anisotropy).
         mapmri_method : {'closed_form', 'canonical', 'signal'}, optional
             How MAP-MRI/SHORE scalars are obtained: closed-form EAP moments
             (default), or a ``mapmri_fit_model`` fit to a synthetic canonical
@@ -915,6 +932,8 @@ class FORCEModel(ReconstModel):
             compute_mapmri=compute_mapmri,
             compute_ng=compute_ng,
             compute_qti=compute_qti,
+            compute_rsi=compute_rsi,
+            compute_gqi=compute_gqi,
             metric_method=metric_method,
             mapmri_method=mapmri_method,
             mapmri_fit_model=mapmri_fit_model,
@@ -1396,6 +1415,51 @@ class FORCEFit(ReconstFit):
     def k_shear(self):
         """Anisotropic (fibre/shape) kurtosis (QTI; from compute_qti)."""
         return self._params.get("k_shear", None)
+
+    @property
+    def rnt(self):
+        """RSI restricted total (NT; restricted signal fraction = rnt**2)."""
+        return self._params.get("rnt", None)
+
+    @property
+    def rn0(self):
+        """RSI restricted isotropic (N0; isotropic-restricted / cellularity)."""
+        return self._params.get("rn0", None)
+
+    @property
+    def rnd(self):
+        """RSI restricted directional (ND; oriented/neurite-restricted)."""
+        return self._params.get("rnd", None)
+
+    @property
+    def hnt(self):
+        """RSI hindered total (NT)."""
+        return self._params.get("hnt", None)
+
+    @property
+    def hn0(self):
+        """RSI hindered isotropic (N0)."""
+        return self._params.get("hn0", None)
+
+    @property
+    def hnd(self):
+        """RSI hindered directional (ND)."""
+        return self._params.get("hnd", None)
+
+    @property
+    def fnt(self):
+        """RSI free-water total (NT; free signal fraction = fnt**2)."""
+        return self._params.get("fnt", None)
+
+    @property
+    def gfa(self):
+        """GQI generalized fractional anisotropy of the mixture ODF."""
+        return self._params.get("gfa", None)
+
+    @property
+    def qa(self):
+        """GQI quantitative anisotropy (max - min) of the mixture ODF."""
+        return self._params.get("qa", None)
 
     @property
     def odf(self):

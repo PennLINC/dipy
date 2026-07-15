@@ -183,7 +183,8 @@ def orientation_moment_tensors(verts):
 
 def moments_from_odfs(
     intra_odf, extra_odf, verts, d_par, d_perp,
-    gm_frac, gm_d, csf_frac, csf_d, *, intra_dperp=0.0, VV=None, VV4=None,
+    gm_frac, gm_d, csf_frac, csf_d, *, soma_frac=0.0, soma_d=1.0e-3,
+    intra_dperp=0.0, VV=None, VV4=None,
 ):
     """Mean tensor ``D_app`` and covariance ``C`` of the mixture.
 
@@ -193,6 +194,10 @@ def moments_from_odfs(
     fraction>``.  Scalars may be arrays (one per voxel).  Set ``intra_dperp`` to
     a small floor to regularize otherwise-degenerate sticks (only for q-space
     indices; leave 0 for the true cumulant DKI).
+
+    ``soma_frac`` / ``soma_d`` add an optional isotropic *soma/dot* compartment
+    (a low-diffusivity isotropic Gaussian; ``soma_d -> 0`` is the dot limit).
+    With ``soma_frac=0`` (the default) it contributes nothing.
     """
     intra_odf = np.atleast_2d(np.asarray(intra_odf, np.float64))
     extra_odf = np.atleast_2d(np.asarray(extra_odf, np.float64))
@@ -205,6 +210,8 @@ def moments_from_odfs(
     gm_d = np.broadcast_to(np.asarray(gm_d, np.float64), (n,))
     csf_frac = np.broadcast_to(np.asarray(csf_frac, np.float64), (n,))
     csf_d = np.broadcast_to(np.asarray(csf_d, np.float64), (n,))
+    soma_frac = np.broadcast_to(np.asarray(soma_frac, np.float64), (n,))
+    soma_d = np.broadcast_to(np.asarray(soma_d, np.float64), (n,))
     ip = np.broadcast_to(np.asarray(intra_dperp, np.float64), (n,))
 
     I3 = np.eye(3)
@@ -217,7 +224,7 @@ def moments_from_odfs(
     O4_ex = np.einsum("nv,vijkl->nijkl", extra_odf, VV4)
     w_in = intra_odf.sum(1)                              # total intra weight
     w_ex = extra_odf.sum(1)
-    _check_mixture_weights(w_in + w_ex + gm_frac + csf_frac)
+    _check_mixture_weights(w_in + w_ex + gm_frac + csf_frac + soma_frac)
 
     # --- mean tensor D_app -------------------------------------------------
     a = d_par[:, None, None]
@@ -227,7 +234,8 @@ def moments_from_odfs(
     D_ex = p_e * (w_ex[:, None, None] * I3) + (a - p_e) * Om_ex
     D_gm = (gm_frac * gm_d)[:, None, None] * I3
     D_csf = (csf_frac * csf_d)[:, None, None] * I3
-    D_app = D_in + D_ex + D_gm + D_csf                   # (n,3,3)
+    D_soma = (soma_frac * soma_d)[:, None, None] * I3
+    D_app = D_in + D_ex + D_gm + D_csf + D_soma          # (n,3,3)
 
     # --- second moment <D (x) D> ------------------------------------------
     def _second_moment(w, Om, O4, dpar, dperp):
@@ -242,7 +250,8 @@ def moments_from_odfs(
     DD = (_second_moment(w_in, Om_in, O4_in, d_par, ip)
           + _second_moment(w_ex, Om_ex, O4_ex, d_par, d_perp)
           + (gm_frac * gm_d ** 2)[:, None, None, None, None] * IxI
-          + (csf_frac * csf_d ** 2)[:, None, None, None, None] * IxI)
+          + (csf_frac * csf_d ** 2)[:, None, None, None, None] * IxI
+          + (soma_frac * soma_d ** 2)[:, None, None, None, None] * IxI)
     C = DD - np.einsum("nij,nkl->nijkl", D_app, D_app)
     return D_app, C
 
@@ -250,12 +259,14 @@ def moments_from_odfs(
 def synth_signal_from_odfs(
     intra_odf, extra_odf, verts, d_par, d_perp,
     gm_frac, gm_d, csf_frac, csf_d, bvals, bvecs,
+    *, soma_frac=0.0, soma_d=1.0e-3,
 ):
     """Noise-free mixture signal (S0=1) on an arbitrary gradient table.
 
     Used to build a *canonical* scheme-independent signal for the
     ``metric_method='canonical'`` DTI/DKI fit and for the anisotropic MAP-MRI
-    fit that yields NG/PA.
+    fit that yields NG/PA.  ``soma_frac``/``soma_d`` add the optional isotropic
+    soma/dot compartment.
     """
     intra_odf = np.atleast_2d(np.asarray(intra_odf, np.float64))
     extra_odf = np.atleast_2d(np.asarray(extra_odf, np.float64))
@@ -270,6 +281,8 @@ def synth_signal_from_odfs(
     gm_d = np.broadcast_to(np.asarray(gm_d, np.float64), (n,))
     csf_frac = np.broadcast_to(np.asarray(csf_frac, np.float64), (n,))
     csf_d = np.broadcast_to(np.asarray(csf_d, np.float64), (n,))
+    soma_frac = np.broadcast_to(np.asarray(soma_frac, np.float64), (n,))
+    soma_d = np.broadcast_to(np.asarray(soma_d, np.float64), (n,))
 
     cos2 = (bvecs @ verts.T) ** 2                        # (G, M) = (g.v)^2
     bb = bvals[None, :, None]                            # (1,G,1)
@@ -287,6 +300,7 @@ def synth_signal_from_odfs(
               + np.einsum("nv,ngv->ng", extra_odf[s:e], exp_ex))
         Sk += gm_frac[s:e, None] * np.exp(-bvals[None, :] * gm_d[s:e, None])
         Sk += csf_frac[s:e, None] * np.exp(-bvals[None, :] * csf_d[s:e, None])
+        Sk += soma_frac[s:e, None] * np.exp(-bvals[None, :] * soma_d[s:e, None])
         S[s:e] = Sk
     return S
 
@@ -296,7 +310,8 @@ def synth_signal_from_odfs(
 # ---------------------------------------------------------------------------
 def mapmri_closed_form_indices(
     intra_odf, extra_odf, verts, d_par, d_perp,
-    gm_frac, gm_d, csf_frac, csf_d, tau, *, d_perp_floor=0.12e-3,
+    gm_frac, gm_d, csf_frac, csf_d, tau, *, soma_frac=0.0, soma_d=1.0e-3,
+    d_perp_floor=0.12e-3,
 ):
     """RTOP, RTAP, RTPP, MSD, QIV in closed form from the Gaussian mixture.
 
@@ -321,6 +336,8 @@ def mapmri_closed_form_indices(
     gm_d = np.broadcast_to(np.asarray(gm_d, np.float64), (n,))
     csf_frac = np.broadcast_to(np.asarray(csf_frac, np.float64), (n,))
     csf_d = np.broadcast_to(np.asarray(csf_d, np.float64), (n,))
+    soma_frac = np.broadcast_to(np.asarray(soma_frac, np.float64), (n,))
+    soma_d = np.broadcast_to(np.asarray(soma_d, np.float64), (n,))
     fl = float(d_perp_floor)
 
     w_in = intra_odf.sum(1)
@@ -329,7 +346,8 @@ def mapmri_closed_form_indices(
     # mean tensor for the axis and for MSD (use TRUE sticks: intra d_perp=0)
     D_app, _ = moments_from_odfs(
         intra_odf, extra_odf, verts, d_par, d_perp,
-        gm_frac, gm_d, csf_frac, csf_d, intra_dperp=0.0,
+        gm_frac, gm_d, csf_frac, csf_d,
+        soma_frac=soma_frac, soma_d=soma_d, intra_dperp=0.0,
     )
     axis = np.linalg.eigh(D_app)[1][:, :, -1]            # principal evec (n,3)
 
@@ -344,6 +362,7 @@ def mapmri_closed_form_indices(
     rtop = four_pi_tau ** -1.5 * (
         w_in * det_in ** -0.5 + w_ex * det_ex ** -0.5
         + gm_frac * gm_d ** -1.5 + csf_frac * csf_d ** -1.5
+        + soma_frac * soma_d ** -1.5
     )
     # QIV = 4 pi^2 / (-nabla^2 P(0)); nabla^2 N_c(0) = -N_c(0) trace(Sigma_c^-1)
     def _lap_iso(w, d):     # isotropic compartment, Sigma=2 tau d I
@@ -357,6 +376,7 @@ def mapmri_closed_form_indices(
     lap = -(
         _lap_aniso(w_in, d_par, fl) + _lap_aniso(w_ex, d_par, d_perp)
         + _lap_iso(gm_frac, gm_d) + _lap_iso(csf_frac, csf_d)
+        + _lap_iso(soma_frac, soma_d)
     )
     qiv = -4.0 * np.pi ** 2 / lap
 
@@ -370,6 +390,7 @@ def mapmri_closed_form_indices(
         (intra_odf / np.sqrt(dpar_in)).sum(1)
         + (extra_odf / np.sqrt(dpar_ex)).sum(1)
         + gm_frac / np.sqrt(gm_d) + csf_frac / np.sqrt(csf_d)
+        + soma_frac / np.sqrt(soma_d)
     )
     # perpendicular 2x2 determinant of an axisymmetric tensor (evals a,p,p)
     # whose axis makes angle theta with a_hat (cos^2 = cos2):
@@ -380,6 +401,7 @@ def mapmri_closed_form_indices(
         (intra_odf / np.sqrt(detperp_in)).sum(1)
         + (extra_odf / np.sqrt(detperp_ex)).sum(1)
         + gm_frac / gm_d + csf_frac / csf_d
+        + soma_frac / soma_d
     )
     return {"rtop": rtop, "rtap": rtap, "rtpp": rtpp, "msd": msd, "qiv": qiv}
 
@@ -506,12 +528,13 @@ NG_PA_KEYS = ("ng", "ngpar", "ngperp", "pa")
 
 def ng_pa_from_odfs(
     intra_odf, extra_odf, verts, d_par, d_perp, gm_frac, gm_d, csf_frac, csf_d,
-    *, floor=0.12e-3, top_k=28,
+    *, soma_frac=0.0, soma_d=1.0e-3, floor=0.12e-3, top_k=28,
 ):
     """Batched closed-form NG/NGpar/NGperp/PA for FORCE library entries,
     reconstructing each entry's Gaussian mixture from the emitted orientation
     weights.  Returns a dict of length-N arrays.  ``top_k`` keeps only the
-    strongest orientation-weight directions per entry for efficiency."""
+    strongest orientation-weight directions per entry for efficiency.
+    ``soma_frac``/``soma_d`` add the optional isotropic soma/dot compartment."""
     intra_odf = np.atleast_2d(np.asarray(intra_odf, np.float64))
     extra_odf = np.atleast_2d(np.asarray(extra_odf, np.float64))
     verts = np.asarray(verts, np.float64)
@@ -523,6 +546,7 @@ def ng_pa_from_odfs(
     d_par, d_perp = _b(d_par), _b(d_perp)
     gm_frac, gm_d = _b(gm_frac), _b(gm_d)
     csf_frac, csf_d = _b(csf_frac), _b(csf_d)
+    soma_frac, soma_d = _b(soma_frac), _b(soma_d)
     out = {k: np.zeros(n, np.float64) for k in NG_PA_KEYS}
     I3 = np.eye(3)
     for i in range(n):
@@ -534,8 +558,9 @@ def ng_pa_from_odfs(
         Tin = d_par[i] * vv + floor * (I3 - vv)
         Tex = d_perp[i] * I3 + (d_par[i] - d_perp[i]) * vv
         w = np.concatenate([intra_odf[i][sel], extra_odf[i][sel],
-                            [gm_frac[i]], [csf_frac[i]]])
-        T = np.concatenate([Tin, Tex, (gm_d[i] * I3)[None], (csf_d[i] * I3)[None]])
+                            [gm_frac[i]], [csf_frac[i]], [soma_frac[i]]])
+        T = np.concatenate([Tin, Tex, (gm_d[i] * I3)[None], (csf_d[i] * I3)[None],
+                            (soma_d[i] * I3)[None]])
         m = w > 1e-6
         r = gaussian_mixture_ng_pa(w[m], T[m], floor=floor)
         for k in NG_PA_KEYS:
@@ -614,3 +639,299 @@ def qti_indices_from_moments(D_app, C):
         "k_shear": np.asarray(fit.k_shear, np.float64),
     }
     return {k: np.asarray(v, np.float64).reshape(batch) for k, v in out.items()}
+
+
+# ---------------------------------------------------------------------------
+# Restriction Spectrum Imaging (ABCD RSIproc convention) -- N0/ND/NT
+# ---------------------------------------------------------------------------
+# This is a faithful port of the ABCD-STUDY ``RSIproc`` operator (White 2013;
+# Hagler 2019) so that the FORCE-stored RSI columns match the reference pipeline
+# *numerically*, not merely in spirit.  Each compartment ``c`` is a fixed
+# (D_long, D_trans, SH_order) response; the design projects the signal onto a
+# real-SH-convolution basis and the measures are Euclidean norms of the fitted
+# coefficient blocks:
+#
+#   N0[c] = beta(l=0)          (isotropic component; signed, clipped [-1, 2])
+#   ND[c] = ||beta(l>0)||      (directional component; 0 for SH_order 0)
+#   NT[c] = ||beta(all l)||    (total component)   ->  NT**2 = N0**2 + ND**2
+#
+# Defaults reproduce RSIproc_1_0_8.py exactly: restricted stick (DT->0, l<=4),
+# hindered zeppelin (DT=0.9e-3, l<=4), free isotropic (l=0); uniform Tikhonov
+# regularization ``lambda=0.1 * mean(diag(A^T A))``; ``normalize=False`` (raw
+# betas, RSIproc default).  Override ``compartments``/``rsi_lambda``/``normalize``
+# to mirror a differently-configured RSI pipeline.
+#
+# (name, D_longitudinal, D_transverse, SH_order) in mm^2/s.
+RSI_COMPARTMENTS = (
+    ("r", 1.0e-3, 1.0e-10, 4),   # restricted stick (DT->0 == RSIproc 1e-10)
+    ("h", 1.0e-3, 0.9e-3, 4),    # hindered zeppelin
+    ("f", 3.0e-3, 3.0e-3, 0),    # free water (isotropic, l=0)
+)
+RSI_LAMBDA = 0.1                 # RSIproc RSI_lambda (uniform regularization)
+RSI_ICO_ORDER = 3                # RSIproc make_icosahedron(3) -> 642 vertices
+RSI_KEYS = ("rnt", "rn0", "rnd", "hnt", "hn0", "hnd", "fnt")
+
+
+def _rsi_icosahedron(order=RSI_ICO_ORDER):
+    """Unit-sphere vertices of a subdivided icosahedron, reproducing the
+    reconstruction sphere of ABCD ``RSIproc`` (``make_icosahedron(order)``);
+    ``order=3`` yields 642 points.  The RSI measures are norms of SH-coefficient
+    blocks, so the *vertex order is irrelevant* -- only the point set (hence its
+    density, which sets the coefficient scale) matters, and this reproduces it
+    exactly."""
+    t = (1.0 + np.sqrt(5.0)) / 2.0
+    verts = [
+        (-1, t, 0), (1, t, 0), (-1, -t, 0), (1, -t, 0),
+        (0, -1, t), (0, 1, t), (0, -1, -t), (0, 1, -t),
+        (t, 0, -1), (t, 0, 1), (-t, 0, -1), (-t, 0, 1),
+    ]
+    verts = [np.asarray(v, np.float64) / np.linalg.norm(v) for v in verts]
+    faces = [
+        (0, 11, 5), (0, 5, 1), (0, 1, 7), (0, 7, 10), (0, 10, 11),
+        (1, 5, 9), (5, 11, 4), (11, 10, 2), (10, 7, 6), (7, 1, 8),
+        (3, 9, 4), (3, 4, 2), (3, 2, 6), (3, 6, 8), (3, 8, 9),
+        (4, 9, 5), (2, 4, 11), (6, 2, 10), (8, 6, 7), (9, 8, 1),
+    ]
+
+    def _midpoint(cache, a, b):
+        key = (a, b) if a < b else (b, a)
+        if key not in cache:
+            m = (verts[a] + verts[b]) * 0.5
+            verts.append(m / np.linalg.norm(m))
+            cache[key] = len(verts) - 1
+        return cache[key]
+
+    for _ in range(order):
+        cache, new_faces = {}, []
+        for a, b, c in faces:
+            ab = _midpoint(cache, a, b)
+            bc = _midpoint(cache, b, c)
+            ca = _midpoint(cache, c, a)
+            new_faces += [(a, ab, ca), (ab, b, bc), (bc, c, ca), (ab, bc, ca)]
+        faces = new_faces
+    return np.asarray(verts)
+
+
+def rsi_operator(bvals, bvecs, *, compartments=RSI_COMPARTMENTS,
+                 rsi_lambda=RSI_LAMBDA, ico_order=RSI_ICO_ORDER):
+    """Build the ABCD RSIproc linear estimator ``W`` (and its column layout) for
+    a gradient scheme.  ``beta = W @ (S / S0)`` recovers the RSI coefficients.
+
+    Returns ``(W, L, cid)`` where ``W`` is ``(nFit, nMeas)``, ``L`` the SH order
+    per coefficient, and ``cid`` the compartment id per coefficient.  Faithful to
+    ``RSIproc.calculateA``/``calculateW``: ``A = (R @ pinv(Y_l).T) * Y00`` per
+    compartment, ``W = (A^T A + lambda*mean(diag(A^T A)) I)^-1 A^T``."""
+    from dipy.core.geometry import cart2sphere
+    from dipy.reconst.shm import real_sh_descoteaux_from_index, sph_harm_ind_list
+
+    bvals = np.asarray(bvals, np.float64)
+    bvecs = np.asarray(bvecs, np.float64)
+    verts = _rsi_icosahedron(ico_order)
+    max_order = max(c[3] for c in compartments)
+    m_l, l_l = sph_harm_ind_list(max_order)
+    _, theta, phi = cart2sphere(verts[:, 0], verts[:, 1], verts[:, 2])
+    YL = np.stack([real_sh_descoteaux_from_index(m, l, theta, phi)
+                   for m, l in zip(m_l, l_l)], axis=1)          # (M, nSHmax)
+    Y00 = float(real_sh_descoteaux_from_index(0, 0, theta[:1], phi[:1])[0])
+    cos2 = (bvecs @ verts.T) ** 2                              # (nMeas, M)
+
+    blocks, Ls, cids = [], [], []
+    for ci, (_, DL, DT, sho) in enumerate(compartments):
+        sel = l_l <= sho                                       # contiguous l-prefix
+        R = np.exp(-bvals[:, None] * (DT + (DL - DT) * cos2))  # (nMeas, M)
+        A = R @ np.linalg.pinv(YL[:, sel]).T                   # (nMeas, nSH_c)
+        blocks.append(A)
+        Ls.append(l_l[sel])
+        cids.append(np.full(int(sel.sum()), ci))
+    A = np.hstack(blocks) * Y00
+    L = np.concatenate(Ls)
+    cid = np.concatenate(cids)
+    AtA = A.T @ A
+    W = np.linalg.solve(
+        AtA + rsi_lambda * np.mean(np.diag(AtA)) * np.eye(A.shape[1]), A.T)
+    return W, L, cid
+
+
+def rsi_indices_from_signals(signals, gtab, verts=None, *,
+                             compartments=RSI_COMPARTMENTS,
+                             rsi_lambda=RSI_LAMBDA, normalize=False,
+                             ico_order=RSI_ICO_ORDER):
+    """ABCD-RSIproc directional RSI measures (N0/ND/NT per compartment) for a set
+    of FORCE library signals, by the *exact fixed-basis linear projection* of the
+    signals through the RSIproc operator -- i.e. the noise-free limit of an RSI
+    fit, with no per-voxel iterative fitting.
+
+    ``signals`` : (n, n_meas) signals; ``gtab`` : their gradient table.  ``verts``
+    is accepted for backwards compatibility but ignored -- RSI uses its own fixed
+    icosahedral reconstruction sphere (``ico_order``).  With ``normalize=False``
+    (the RSIproc default) the returned N0/ND/NT are raw coefficient norms that
+    match the reference pipeline numerically; with ``normalize=True`` each is
+    divided by the total coefficient L2-norm so ``NT**2`` is a signal fraction.
+
+    Returns ``rnt/rn0/rnd`` (restricted), ``hnt/hn0/hnd`` (hindered), ``fnt``
+    (free); per compartment ``NT**2 = N0**2 + ND**2``.
+    """
+    signals = np.atleast_2d(np.asarray(signals, np.float64))
+    bvals = np.asarray(gtab.bvals, np.float64)
+    W, L, cid = rsi_operator(bvals, np.asarray(gtab.bvecs, np.float64),
+                             compartments=compartments, rsi_lambda=rsi_lambda,
+                             ico_order=ico_order)
+    b0 = bvals <= getattr(gtab, "b0_threshold", 50)
+    S0 = signals[:, b0].mean(1) if np.any(b0) else signals.max(1)
+    beta = (signals / np.maximum(S0, 1e-9)[:, None]) @ W.T     # (n, nFit)
+    full_norm = (np.linalg.norm(beta, axis=1) if normalize
+                 else np.ones(len(beta)))
+    full_norm = np.maximum(full_norm, 1e-12)
+
+    out = {}
+    for ci, (name, _DL, _DT, _sho) in enumerate(compartments):
+        b = beta[:, cid == ci]
+        li = L[cid == ci]
+        n0 = b[:, li == 0][:, 0] / full_norm                   # signed (RSIproc)
+        if not normalize:                                      # RSIproc n0 clip
+            n0 = np.clip(n0, -1.0, 2.0)
+        nt = np.linalg.norm(b, axis=1) / full_norm
+        nd = (np.linalg.norm(b[:, li > 0], axis=1) / full_norm
+              if np.any(li > 0) else np.zeros(len(b)))
+        out[name] = (n0, nd, nt)
+
+    r, h, f = out["r"], out["h"], out["f"]
+    return {
+        "rnt": r[2], "rn0": r[0], "rnd": r[1],
+        "hnt": h[2], "hn0": h[0], "hnd": h[1],
+        "fnt": f[2],
+    }
+
+
+# ---------------------------------------------------------------------------
+# RISH -- rotation-invariant spherical harmonic power features
+# ---------------------------------------------------------------------------
+# For each non-b0 shell, ||c_l|| = sqrt(sum_m c_lm^2) for l = 0, 2, ... These are
+# exactly the rotation-invariant content of the signal: l=0 is the spherical mean
+# (bulk microstructure) while l>=2 carries dispersion / crossing structure *with
+# no orientation*.  Matching a library on RISH therefore decouples the
+# microstructure search from orientation -- FORCE's raw-signal cosine match is
+# ~90% orientation-blind anyway (most of its L2 energy is b0 + spherical mean),
+# so it wastes library capacity on rotated copies while still failing to pin
+# orientation.  RISH keeps the useful half and drops the nuisance.
+#
+# Basis: MRtrix3 (``tournier07``, ``legacy=False``).  NOTE the per-l power is
+# invariant to *any* orthonormal real-SH basis (descoteaux and tournier differ by
+# a within-l orthogonal transform), so these features are basis-agnostic; we use
+# the MRtrix3 convention for consistency with exported SH.
+RISH_SH_ORDER = 6
+
+
+def _even_sh_order_for(n_dirs, sh_order_max):
+    """Largest even SH order whose basis is not underdetermined by n_dirs."""
+    L = int(sh_order_max)
+    while L > 0 and (L + 1) * (L + 2) // 2 > n_dirs:
+        L -= 2
+    return max(L, 0)
+
+
+def rish_features_from_signals(signals, gtab, *, sh_order_max=RISH_SH_ORDER,
+                               shell_tol=100.0, smooth=0.006, legacy=False):
+    """Per-shell rotation-invariant SH power (RISH) features.
+
+    The SH fit is Laplace-Beltrami regularized (``smooth``, dipy's CSD default),
+    and the SH order is reduced per shell to keep the fit over-determined
+    (``n_dirs >= 2 * n_coef``).  Both matter: RISH is *exactly* rotation invariant
+    only in the continuous limit -- with a finite gradient set the fit residual
+    depends on how the signal lands on the sampling grid, and an under-regularized
+    high-l fit turns that into several percent of spurious rotational variance.
+
+    Parameters
+    ----------
+    signals : ndarray (n, n_meas)
+        Signals (any scale; normalized internally by the b0 mean).
+    gtab : GradientTable
+    sh_order_max : int, optional
+        Maximum even SH order; reduced per shell if a shell is too sparse.
+    shell_tol : float, optional
+        b-value rounding used to group volumes into shells.
+    smooth : float, optional
+        Laplace-Beltrami regularization weight.
+
+    Returns
+    -------
+    dict
+        ``{"rish_b<shell>_l<l>": (n,) ndarray}``, dimensionless (S0-normalized).
+    """
+    from dipy.core.geometry import cart2sphere
+    from dipy.reconst.shm import real_sh_tournier_from_index, sph_harm_ind_list
+
+    signals = np.atleast_2d(np.asarray(signals, np.float64))
+    bvals = np.asarray(gtab.bvals, np.float64)
+    bvecs = np.asarray(gtab.bvecs, np.float64)
+
+    b0 = bvals <= getattr(gtab, "b0_threshold", 50)
+    S0 = signals[:, b0].mean(1) if np.any(b0) else signals.max(1)
+    S = signals / np.maximum(S0, 1e-12)[:, None]
+
+    shells = np.round(bvals / shell_tol) * shell_tol
+    out = {}
+    for shell in np.unique(shells[~b0]):
+        m = (shells == shell) & (~b0)
+        n_dirs = int(m.sum())
+        # keep the fit comfortably over-determined
+        L = _even_sh_order_for(n_dirs // 2, sh_order_max)
+        if L < 2:                                    # too sparse to be useful
+            continue
+        m_l, l_l = sph_harm_ind_list(L)
+        _, theta, phi = cart2sphere(*bvecs[m].T)
+        B = real_sh_tournier_from_index(m_l, l_l, theta[:, None], phi[:, None],
+                                        legacy=legacy)
+        # Laplace-Beltrami regularized least squares
+        lb = (l_l ** 2) * ((l_l + 1) ** 2)
+        BtB = B.T @ B
+        coef = np.linalg.solve(BtB + smooth * np.diag(lb), B.T @ S[:, m].T).T
+        for L_i in range(0, L + 1, 2):
+            out[f"rish_b{int(shell)}_l{L_i}"] = np.linalg.norm(
+                coef[:, l_l == L_i], axis=1)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Generalized q-sampling imaging (GQI) ODF-shape statistics -- GFA / QA
+# ---------------------------------------------------------------------------
+GQI_KEYS = ("gfa", "qa")
+
+
+def gqi_indices_from_odfs(odfs, wm_fraction):
+    """Analytic GQI-style ODF-shape statistics (GFA, QA) for FORCE entries.
+
+    The stored ``odfs`` are the (unnormalized) WM fibre ODF.  To make GFA/QA
+    consistent with the other mixture statistics -- diluted by free water like
+    FA/MD -- the fibre ODF is renormalized to a probability and mixed with an
+    isotropic baseline weighted by the non-WM (GM+CSF) fraction::
+
+        odf = wm_fraction * (fodf / sum fodf) + (1 - wm_fraction) / n_vertices
+
+    **GFA** is dipy's generalized fractional anisotropy of that mixture ODF and
+    **QA** its quantitative anisotropy ``max(odf) - min(odf)`` -- both functions
+    of the ODF samples only (orientation- and scheme-independent).  Pure
+    free-water entries (``wm_fraction -> 0``) give an isotropic ODF, so GFA/QA
+    -> 0.
+
+    Parameters
+    ----------
+    odfs : ndarray (n, n_vertices)
+        Per-entry WM fibre ODF on the FORCE target sphere.
+    wm_fraction : ndarray (n,)
+        Per-entry white-matter signal fraction (dilutes the ODF anisotropy).
+
+    Returns
+    -------
+    dict with ``gfa`` and ``qa`` arrays, each shape ``(n,)``.
+    """
+    from dipy.reconst.odf import gfa as _gfa
+
+    odfs = np.atleast_2d(np.asarray(odfs, np.float64))
+    wm = np.asarray(wm_fraction, np.float64).reshape(-1)
+    n_vert = odfs.shape[1]
+    ssum = odfs.sum(1, keepdims=True)
+    fodf = np.divide(odfs, ssum, out=np.zeros_like(odfs), where=ssum > 0)
+    odf = wm[:, None] * fodf + (1.0 - wm)[:, None] / n_vert
+    gfa = np.atleast_1d(np.asarray(_gfa(odf))).reshape(-1)
+    return {"gfa": gfa, "qa": odf.max(1) - odf.min(1)}

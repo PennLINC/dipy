@@ -233,3 +233,85 @@ def test_compute_microstructure_uncertainty_ambiguity_different_ranges():
     # Larger prior range should give smaller normalized values
     assert unc_large[0] < unc_small[0]
     assert amb_large[0] < amb_small[0]
+
+
+def test_force_response_matches_dipy_msmt():
+    """force_response reproduces multi_shell_fiber_response to machine precision
+    for a single tensor (validates the analytic stick+zeppelin rotational-harmonic
+    response used by FORCE-informed MSMT-CSD)."""
+    from dipy.reconst.force_csd import force_response
+    from dipy.reconst.mcsd import multi_shell_fiber_response
+
+    ub = np.array([0.0, 1000.0, 2000.0, 3000.0])
+    l1, l2 = 1.7e-3, 0.2e-3
+    gm_d, csf_d = 1.0e-3, 3.0e-3
+    ref = multi_shell_fiber_response(
+        8, list(ub),
+        np.array([[l1, l2, l2, 1.0] for _ in ub[ub > 0]]),
+        np.array([[gm_d] * 3 + [1.0] for _ in ub[ub > 0]]),
+        np.array([[csf_d] * 3 + [1.0] for _ in ub[ub > 0]]),
+    )
+    # f_intra=0 makes the stick+zeppelin kernel a single tensor (l1, l2, l2);
+    # iso order matches dipy (csf first, gm second)
+    mine = force_response(ub, l1, l2, 0.0, [csf_d, gm_d], sh_order_max=8)
+    assert mine.response.shape == ref.response.shape
+    assert mine.iso == ref.iso == 2
+    np.testing.assert_allclose(mine.response, ref.response, atol=1e-9)
+
+
+def test_force_response_soma_adds_iso_column():
+    """Passing three isotropic diffusivities yields a 3-iso response (soma)."""
+    from dipy.reconst.force_csd import force_response
+
+    ub = np.array([0.0, 1000.0, 2000.0, 3000.0])
+    r2 = force_response(ub, 1.7e-3, 0.3e-3, 0.7, [3e-3, 1e-3], sh_order_max=8)
+    r3 = force_response(ub, 1.7e-3, 0.3e-3, 0.7, [3e-3, 1e-3, 0.3e-3], sh_order_max=8)
+    assert r2.iso == 2 and r3.iso == 3
+    assert r3.response.shape[1] == r2.response.shape[1] + 1
+
+
+def test_force_response_ssst_is_axsym():
+    """Single-shell FORCE response is an AxSymShResponse with the right number of
+    zonal coefficients, and its S0 coefficient is positive (DC of the kernel)."""
+    from dipy.reconst.force_csd import force_response_ssst
+
+    r = force_response_ssst(1000.0, 1.7e-3, 0.3e-3, 0.7, sh_order_max=8)
+    assert r.dwi_response.shape == (5,)          # l = 0,2,4,6,8
+    assert r.dwi_response[0] > 0                  # isotropic (l=0) part positive
+
+
+def test_force_informed_fodf_ssst_resolves_crossing():
+    """End-to-end single-shell CSD path: a clean 60-deg two-fibre crossing on a
+    single b=1000 shell is resolved into two peaks near the true directions."""
+    from dipy.core.gradients import gradient_table
+    from dipy.data import get_sphere
+    from dipy.sims.voxel import multi_tensor
+    from dipy.direction import peak_directions
+    from dipy.reconst.force_csd import force_informed_fodf_ssst
+    from dipy.reconst.shm import sh_to_sf
+
+    sph = get_sphere(name="repulsion724")
+    rng = np.random.default_rng(0)
+    dirs = sph.vertices[rng.choice(len(sph.vertices), 64, replace=False)]
+    bvals = np.r_[np.zeros(6), np.full(64, 1000.0)]
+    bvecs = np.vstack([np.zeros((6, 3)), dirs])
+    gtab = gradient_table(bvals, bvecs=bvecs)
+
+    l1, l2, f_in = 1.7e-3, 0.3e-3, 0.7
+    mevals = np.array([[l1, l2, l2], [l1, l2, l2]])
+    u = np.array([0.0, 0.0, 1.0])
+    v = np.array([np.sin(np.deg2rad(60)), 0.0, np.cos(np.deg2rad(60))])
+    S, _ = multi_tensor(gtab, mevals, S0=1.0,
+                        angles=[u, v], fractions=[50, 50], snr=None)
+
+    kern = np.array([[l1, l2, f_in, 3e-3, 1e-3]])
+    fodf_sh, _ = force_informed_fodf_ssst(S[None], gtab, kern, n_bins=1,
+                                          sh_order_max=8)
+    odf = sh_to_sf(fodf_sh[0], sph, sh_order_max=8,
+                   basis_type="descoteaux07", legacy=True)
+    peaks, _, _ = peak_directions(odf, sph, relative_peak_threshold=0.35,
+                                  min_separation_angle=25.0)
+    assert len(peaks) >= 2                        # crossing resolved
+    # both true directions matched within 15 deg
+    C = np.degrees(np.arccos(np.clip(np.abs(np.array([u, v]) @ peaks[:2].T), 0, 1)))
+    assert C.min(axis=1).max() < 15.0

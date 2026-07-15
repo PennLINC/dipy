@@ -154,8 +154,14 @@ def _generate_batch_worker(
 
     Opens memmaps by path in each process and writes directly.
     """
-    from dipy.sims._force_core import create_mixed_signal, set_diffusivity_ranges
+    from dipy.sims._force_core import (
+        create_mixed_signal, set_diffusivity_ranges, set_fiber_probs,
+    )
     from dipy.sims._multi_tensor_omp import multi_tensor
+
+    # fibre-count probabilities travel alongside the diffusivity config
+    diffusivity_cfg = dict(diffusivity_cfg)
+    set_fiber_probs(diffusivity_cfg.pop("_fiber_probs", (0.1, 0.2, 0.7)))
 
     # Unpack memmap info
     (
@@ -459,6 +465,7 @@ def generate_force_simulations(
     tortuosity=False,
     odi_range=(0.01, 0.3),
     num_odi_values=10,
+    num_fiber_probs=(0.1, 0.2, 0.7),
     diffusivity_config=None,
     dtype=np.float32,
     compute_dti=True,
@@ -466,6 +473,12 @@ def generate_force_simulations(
     compute_mapmri=False,
     compute_ng=False,
     compute_qti=False,
+    compute_rsi=False,
+    compute_gqi=False,
+    compute_rish=False,
+    include_soma=False,
+    soma_fraction_range=(0.0, 0.35),
+    soma_d_range=(0.1e-3, 0.5e-3),
     metric_method="canonical",
     mapmri_method="closed_form",
     mapmri_fit_model="mapmri",
@@ -505,6 +518,12 @@ def generate_force_simulations(
         (min, max) orientation dispersion index range.
     num_odi_values : int, optional
         Number of ODI values to sample.
+    num_fiber_probs : sequence of 3 floats, optional
+        Probabilities of drawing a 1-, 2-, or 3-fibre white-matter
+        configuration; renormalized to sum to 1.  The default
+        ``(0.1, 0.2, 0.7)`` is 3-fibre-heavy, which under-covers 2-fibre
+        crossings and degrades crossing-fibre ODF fidelity.  Emphasize crossings
+        with e.g. ``(0.2, 0.5, 0.3)``.
     diffusivity_config : dict, optional
         Custom diffusivity ranges.
     dtype : dtype, optional
@@ -524,6 +543,39 @@ def generate_force_simulations(
         k_shear) from the mixture covariance. micro_fa is orientation-dispersion
         invariant; k_bulk/k_shear split kurtosis into isotropic (free-water) and
         anisotropic (fibre) parts. Available without tensor-valued acquisitions.
+    compute_rsi : bool, optional
+        Compute ABCD-style directional Restriction Spectrum Imaging measures
+        (rnt/rn0/rnd, hnt/hn0/hnd, fnt) by the exact fixed-basis projection of
+        the library signals onto the RSI SH model -- the noise-free limit of an
+        RSI fit, with no per-voxel fitting.
+    compute_rish : bool, optional
+        Store per-shell rotation-invariant SH power (RISH) features
+        ``rish_b<shell>_l<l>`` for l = 0, 2, 4, 6.  These carry the signal's
+        rotation-invariant content -- l=0 is the spherical mean, l>=2 carries
+        dispersion/crossing structure with no orientation -- and are what an
+        orientation-decoupled library match should use.
+    include_soma : bool, optional
+        Add an optional isotropic **soma/dot** compartment to every library
+        entry: a low-diffusivity isotropic Gaussian whose ``soma_d -> 0`` limit
+        is a dot (fully restricted) compartment.  Its volume fraction and
+        diffusivity are drawn per entry from ``soma_fraction_range`` /
+        ``soma_d_range``; all other compartment fractions are shrunk by
+        ``1 - soma_fraction`` so the mixture still sums to 1, and
+        ``soma_fraction``/``soma_d`` are stored with the library.  Off by
+        default, so existing behaviour is unchanged.
+
+        This is a *Gaussian* soma proxy.  A true restricted sphere (as in SANDI)
+        is non-Gaussian and would invalidate the analytic DKI/MAP-MRI/QTI closed
+        forms the rest of this module relies on; a low-diffusivity isotropic
+        Gaussian keeps every scalar exact while still presenting
+        isotropically-restricted signal -- e.g. to the restricted-isotropic (N0)
+        term of RSI, which otherwise has no generative counterpart.
+    soma_fraction_range : tuple, optional
+        (min, max) volume fraction of the soma/dot compartment.
+    soma_d_range : tuple, optional
+        (min, max) isotropic diffusivity of the soma/dot compartment (mm^2/s).
+        Values well below the hindered (~0.9e-3) and free (3e-3) regimes make it
+        read as restricted.
     mapmri_method : {'closed_form', 'canonical', 'signal'}, optional
         How the MAP-MRI/SHORE scalars are obtained.
 
@@ -581,7 +633,7 @@ def generate_force_simulations(
     from tqdm import tqdm
 
     from dipy.reconst import dti
-    from dipy.sims._force_core import set_diffusivity_ranges
+    from dipy.sims._force_core import set_diffusivity_ranges, set_fiber_probs
 
     num_cpus = determine_num_processes(num_cpus)
 
@@ -602,6 +654,12 @@ def generate_force_simulations(
         }
 
     set_diffusivity_ranges(**diffusivity_config)
+    set_fiber_probs(num_fiber_probs)
+    # Config handed to each worker (spawned workers re-import the module fresh,
+    # so both the diffusivity ranges and the fibre-count probabilities must be
+    # re-applied there).  '_fiber_probs' is popped by the worker before the rest
+    # is forwarded to set_diffusivity_ranges.
+    worker_cfg = {**diffusivity_config, "_fiber_probs": tuple(num_fiber_probs)}
 
     # Setup sphere and ODI values
     sphere = default_sphere
@@ -779,7 +837,7 @@ def generate_force_simulations(
                 wm_threshold,
                 tortuosity,
                 memmap_info,
-                diffusivity_config,
+                worker_cfg,
             )
             pbar.update(batch_done)
     elif sys.platform == "win32":
@@ -802,7 +860,7 @@ def generate_force_simulations(
                         wm_threshold,
                         tortuosity,
                         memmap_info,
-                        diffusivity_config,
+                        worker_cfg,
                     ): (start_idx, bs)
                     for start_idx, bs in batch_specs
                 }
@@ -870,6 +928,50 @@ def generate_force_simulations(
     for mm in memmaps:
         mm.flush()
 
+    # --- optional soma / dot compartment ----------------------------------
+    # An isotropic Gaussian of low diffusivity (``soma_d -> 0`` is the dot
+    # limit).  It is mixed in here rather than in the Cython generator: the
+    # compartment is isotropic, so it does not interact with the fibre
+    # orientation machinery, and a linear remix is exact.  Every volume-fraction
+    # -scaled quantity is shrunk by (1 - soma_fraction) so the mixture weights
+    # still sum to 1, and ``soma_frac``/``soma_d`` are threaded into all the
+    # closed-form scalars.  NOTE: this is a *Gaussian* soma proxy -- a true
+    # restricted sphere (SANDI) is non-Gaussian and would invalidate the
+    # analytic DKI/MAP-MRI/QTI closed forms this library depends on.
+    soma_frac = np.zeros(num_simulations, dtype=np.float64)
+    soma_d = np.full(num_simulations, 1.0e-3, dtype=np.float64)
+    if include_soma:
+        rng_soma = np.random.default_rng()
+        soma_frac = rng_soma.uniform(
+            soma_fraction_range[0], soma_fraction_range[1], num_simulations)
+        soma_d = rng_soma.uniform(
+            soma_d_range[0], soma_d_range[1], num_simulations)
+        keep = (1.0 - soma_frac)                              # (N,)
+        step_s = 5000
+        for s0 in range(0, num_simulations, step_s):
+            e0 = min(s0 + step_s, num_simulations)
+            k = keep[s0:e0][:, None]
+            # signal: same *100 compartment convention as the Cython generator
+            soma_sig = np.exp(-bvals[None, :] * soma_d[s0:e0, None]) * 100.0
+            signals_mm[s0:e0] = (k * np.asarray(signals_mm[s0:e0], np.float64)
+                                 + soma_frac[s0:e0, None] * soma_sig).astype(dtype)
+            # orientation weights are volume-fraction scaled -> shrink them
+            intra_odf_mm[s0:e0] = (k * np.asarray(intra_odf_mm[s0:e0], np.float64)
+                                   ).astype(intra_odf_mm.dtype)
+            extra_odf_mm[s0:e0] = (k * np.asarray(extra_odf_mm[s0:e0], np.float64)
+                                   ).astype(extra_odf_mm.dtype)
+            odfs_mm[s0:e0] = (k * np.asarray(odfs_mm[s0:e0], np.float64)
+                              ).astype(odfs_mm.dtype)
+        kv = keep
+        for mm_ in (wm_fraction_mm, gm_fraction_mm, csf_fraction_mm,
+                    nd_mm, ufa_voxel_mm):
+            mm_[:] = (kv * np.asarray(mm_, np.float64)).astype(mm_.dtype)
+        # soma is isotropic -> ODI 1.0, like GM/CSF in the generator
+        dispersion_mm[:] = (kv * np.asarray(dispersion_mm, np.float64)
+                            + soma_frac * 1.0).astype(dispersion_mm.dtype)
+        for mm in memmaps:
+            mm.flush()
+
     # Per-entry DTI / DKI / MAP-MRI scalars -------------------------------
     fa_dti = np.zeros(num_simulations, dtype=dtype)
     md_dti = np.zeros(num_simulations, dtype=dtype)
@@ -912,14 +1014,21 @@ def generate_force_simulations(
         dki_scalars_from_params,
         mapmri_closed_form_indices,
         mapmri_indices_via_fit,
+        RSI_KEYS,
+        GQI_KEYS,
         moments_from_odfs,
         ng_pa_from_odfs,
         orientation_moment_tensors,
         qti_indices_from_moments,
+        rsi_indices_from_signals,
+        gqi_indices_from_odfs,
+        rish_features_from_signals,
         synth_signal_from_odfs,
     )
     ng_arr = {k: np.zeros(num_simulations, dtype=dtype) for k in NG_PA_KEYS}
     qti_arr = {k: np.zeros(num_simulations, dtype=dtype) for k in QTI_KEYS}
+    rsi_arr = {k: np.zeros(num_simulations, dtype=dtype) for k in RSI_KEYS}
+    gqi_arr = {k: np.zeros(num_simulations, dtype=dtype) for k in GQI_KEYS}
 
     verts = target_sphere
 
@@ -977,6 +1086,7 @@ def generate_force_simulations(
                 if metric_method == "cumulant":
                     D_app, C = moments_from_odfs(
                         io, eo, verts, dpar, dperp, gmf, gmd, csff, csfd,
+                        soma_frac=soma_frac[start:end], soma_d=soma_d[start:end],
                         VV=VV, VV4=VV4,
                     )
                     sc = dki_scalars_from_params(dki_params_from_moments(D_app, C))
@@ -984,6 +1094,7 @@ def generate_force_simulations(
                     S = synth_signal_from_odfs(
                         io, eo, verts, dpar, dperp, gmf, gmd, csff, csfd,
                         canon_gtab.bvals, canon_gtab.bvecs,
+                        soma_frac=soma_frac[start:end], soma_d=soma_d[start:end],
                     )
                     if compute_dki:
                         f = dki_model.fit(S)
@@ -1022,6 +1133,7 @@ def generate_force_simulations(
                 io, eo, dpar, dperp, gmf, gmd, csff, csfd = _read_mixture(start, end)
                 idx = mapmri_closed_form_indices(
                     io, eo, verts, dpar, dperp, gmf, gmd, csff, csfd, tau,
+                    soma_frac=soma_frac[start:end], soma_d=soma_d[start:end],
                     d_perp_floor=intra_dperp_floor,
                 )
             elif mapmri_method == "canonical":
@@ -1029,6 +1141,7 @@ def generate_force_simulations(
                 S = synth_signal_from_odfs(
                     io, eo, verts, dpar, dperp, gmf, gmd, csff, csfd,
                     mm_gtab.bvals, mm_gtab.bvecs,
+                    soma_frac=soma_frac[start:end], soma_d=soma_d[start:end],
                 )
                 idx = mapmri_indices_via_fit(S, mm_gtab, model=mapmri_fit_model)
             else:  # signal
@@ -1049,6 +1162,8 @@ def generate_force_simulations(
             end = min(start + step, num_simulations)
             io, eo, dpar, dperp, gmf, gmd, csff, csfd = _read_mixture(start, end)
             r = ng_pa_from_odfs(io, eo, verts, dpar, dperp, gmf, gmd, csff, csfd,
+                                soma_frac=soma_frac[start:end],
+                                soma_d=soma_d[start:end],
                                 floor=intra_dperp_floor)
             for k in NG_PA_KEYS:
                 ng_arr[k][start:end] = np.asarray(r[k], dtype)
@@ -1063,12 +1178,37 @@ def generate_force_simulations(
             end = min(start + step, num_simulations)
             io, eo, dpar, dperp, gmf, gmd, csff, csfd = _read_mixture(start, end)
             D_app, C = moments_from_odfs(
-                io, eo, verts, dpar, dperp, gmf, gmd, csff, csfd)
+                io, eo, verts, dpar, dperp, gmf, gmd, csff, csfd,
+                soma_frac=soma_frac[start:end], soma_d=soma_d[start:end])
             r = qti_indices_from_moments(D_app, C)
             for k in QTI_KEYS:
                 qti_arr[k][start:end] = np.asarray(r[k], dtype)
             pbar.update(end - start)
         pbar.close()
+
+    # --- RSI (directional SH, exact fixed-basis projection of the signals) --
+    if compute_rsi:
+        if verbose:
+            logger.info("Computing directional RSI (N0/ND/NT) measures.")
+        r = rsi_indices_from_signals(np.asarray(signals_mm), gtab, verts)
+        for k in RSI_KEYS:
+            rsi_arr[k] = np.asarray(r[k], dtype)
+
+    # --- GQI ODF-shape statistics (GFA / QA, closed form from the ODF) -----
+    if compute_gqi:
+        if verbose:
+            logger.info("Computing GQI ODF-shape (GFA/QA) measures.")
+        r = gqi_indices_from_odfs(np.asarray(odfs_mm), np.asarray(wm_fraction_mm))
+        for k in GQI_KEYS:
+            gqi_arr[k] = np.asarray(r[k], dtype)
+
+    # --- RISH: rotation-invariant SH power per shell -----------------------
+    rish_arr = {}
+    if compute_rish:
+        if verbose:
+            logger.info("Computing RISH (rotation-invariant SH power) features.")
+        r = rish_features_from_signals(np.asarray(signals_mm), gtab)
+        rish_arr = {k: np.asarray(v, dtype) for k, v in r.items()}
 
     # Build output simulations dict
     simulations = {
@@ -1108,6 +1248,21 @@ def generate_force_simulations(
 
     if compute_qti:
         simulations.update(qti_arr)
+
+    if compute_rsi:
+        simulations.update(rsi_arr)
+
+    if compute_gqi:
+        simulations.update(gqi_arr)
+
+    if compute_rish:
+        simulations.update(rish_arr)
+
+    if include_soma:
+        simulations.update({
+            "soma_fraction": soma_frac.astype(dtype),
+            "soma_d": soma_d.astype(dtype),
+        })
 
     if store_mixture:
         simulations.update({
